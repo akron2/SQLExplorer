@@ -1,0 +1,48 @@
+name: sqlexplorer-oracle
+
+services:
+  oracle:
+    image: gvenzl/oracle-xe:21-slim-faststart@sha256:f82bccdf6020d27373fdf0e93046b63eb3f777a0289e329d9839feebaf4555de
+    platform: linux/amd64
+    container_name: sqlexplorer-oracle21
+    restart: unless-stopped
+    stop_grace_period: 1m
+    ports:
+      - "127.0.0.1:1521:1521"
+    environment:
+      ORACLE_PASSWORD_FILE: /run/secrets/oracle_admin_password
+      APP_USER: SQLX
+      APP_USER_PASSWORD_FILE: /run/secrets/oracle_app_password
+    secrets:
+      - oracle_admin_password
+      - oracle_app_password
+    volumes:
+      - oracle21_data:/opt/oracle/oradata
+    mem_limit: 4g
+    cpus: 2.0
+    shm_size: 1g
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      start_period: 2m
+      retries: 30
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      purpose: sqlexplorer-local-oracle
+
+volumes:
+  oracle21_data:
+    name: sqlexplorer_oracle21_data
+    labels:
+      purpose: sqlexplorer-local-oracle
+
+secrets:
+  oracle_admin_password:
+    file: ../../.local/oracle/admin-password.txt
+  oracle_app_password:
+    file: ../../.local/oracle/app-password.txt
