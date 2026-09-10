@@ -33,6 +33,17 @@ npm run test:electron # Electron UI и восстановление 100 доку
 npm run test:package  # ASAR, renderer, worker и подключения в упакованном exe
 ```
 
+## Линейные окончания (EOL) и чистый Git
+
+Добавлен `.gitattributes`, который принудительно хранит текстовые файлы с `LF`, чтобы не ловить шум от `LF -> CRLF` при коммитах на Windows.
+
+После изменения `.gitattributes` можно переиндексировать файлы и нормализовать истории концовок:
+
+```powershell
+git rm --cached -r .
+git reset --hard
+```
+
 Windows-сборка создаётся в `out/release/SQLExplorer-win32-x64`. В локальном окружении её можно запустить с тестовыми профилями так:
 
 ```powershell
