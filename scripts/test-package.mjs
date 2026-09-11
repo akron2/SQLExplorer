@@ -46,20 +46,18 @@ try {
     throw new Error(`Packaged smoke marker is missing. Output: ${stdout}`);
   }
   console.log(stdout.trim());
-  if (process.env.SQLX_SKIP_DATABASE_TEST !== '1') {
-    const databaseTest = await executeFile(executable, ['--database-test'], {
-      cwd: path.dirname(executable),
-      env: environment,
-      timeout: 90_000,
-      windowsHide: true,
-    });
-    if (!databaseTest.stdout.includes('DATABASE_SELF_TEST_OK')
-      || !databaseTest.stdout.includes('sysdba=passed')
-      || !databaseTest.stdout.includes('reconnect=passed')) {
-      throw new Error(`Packaged database marker is incomplete. Output: ${databaseTest.stdout}`);
-    }
-    console.log(databaseTest.stdout.trim());
+  const databaseTest = await executeFile(executable, ['--database-test'], {
+    cwd: path.dirname(executable),
+    env: environment,
+    timeout: 90_000,
+    windowsHide: true,
+  });
+  if (!databaseTest.stdout.includes('DATABASE_SELF_TEST_OK')
+    || !databaseTest.stdout.includes('sysdba=passed')
+    || !databaseTest.stdout.includes('reconnect=passed')) {
+    throw new Error(`Packaged database marker is incomplete. Output: ${databaseTest.stdout}`);
   }
+  console.log(databaseTest.stdout.trim());
 } finally {
   fs.rmSync(resolvedTestData, { recursive: true, force: true });
 }

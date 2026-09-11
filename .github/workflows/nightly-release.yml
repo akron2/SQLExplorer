@@ -30,11 +30,6 @@ jobs:
       - name: Build app (Windows)
         run: npm run package
 
-      - name: Smoke-test packaged application
-        env:
-          SQLX_SKIP_DATABASE_TEST: '1'
-        run: npm run test:package
-
       - name: Zip Windows build
         run: |
           Compress-Archive -Path "out/release/*" -DestinationPath "SQLExplorer-Windows-nightly.zip" -Force

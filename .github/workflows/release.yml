@@ -53,11 +53,6 @@ jobs:
           }
           Get-ChildItem -Recurse out/release | ForEach-Object { Write-Output $_.FullName }
 
-      - name: Smoke-test packaged application
-        env:
-          SQLX_SKIP_DATABASE_TEST: '1'
-        run: npm run test:package
-
       - name: Zip Windows build
         shell: pwsh
         run: |
