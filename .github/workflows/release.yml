@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build app (Windows)
+        run: npm run package
+
+      - name: Zip Windows build
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "out/release/*" -DestinationPath "SQLExplorer-Windows.zip" -Force
+
+      - name: Create release with assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SQLExplorer-Windows.zip
+          generate_release_notes: true
