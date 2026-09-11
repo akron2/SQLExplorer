@@ -1,0 +1,49 @@
+name: Nightly Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  windows-nightly-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.21.0
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build app (Windows)
+        run: npm run package
+
+      - name: Zip Windows build
+        run: |
+          Compress-Archive -Path "out/release/*" -DestinationPath "SQLExplorer-Windows-nightly.zip" -Force
+
+      - name: Publish nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: SQLExplorer Nightly
+          body: "Automated nightly build from commit ${{ github.sha }} on ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}."
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          files: SQLExplorer-Windows-nightly.zip
+          fail_on_unmatched_files: false
+          overwrite_files: true
+          append_body: true
