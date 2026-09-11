@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and publish'
+        required: true
+        default: 'v0.1.2'
 
 permissions:
   contents: write
@@ -27,16 +33,31 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Compute release tag
+        id: tag
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            "tag=${{ github.event.inputs.tag }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "tag=$($env:GITHUB_REF -replace '^refs/tags/', '')" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
       - name: Build app (Windows)
         run: npm run package
 
       - name: Zip Windows build
         shell: pwsh
         run: |
-          Compress-Archive -Path "out/release/*" -DestinationPath "SQLExplorer-Windows.zip" -Force
+          Compress-Archive -Path "out/release/*" -DestinationPath "SQLExplorer-Windows-${{ steps.tag.outputs.tag }}.zip" -Force
 
       - name: Create release with assets
         uses: softprops/action-gh-release@v2
         with:
-          files: SQLExplorer-Windows.zip
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: SQLExplorer ${{ steps.tag.outputs.tag }}
+          files: SQLExplorer-Windows-${{ steps.tag.outputs.tag }}.zip
+          fail_on_unmatched_files: false
+          overwrite_files: true
+          append_body: true
           generate_release_notes: true
