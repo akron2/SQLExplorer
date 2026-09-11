@@ -16,6 +16,7 @@ export default defineConfig({
       external: [
         ...builtinModules,
         ...builtinModules.map((moduleName) => `node:${moduleName}`),
+        'electron',
         'oracledb',
         'pg',
         'pg-cursor',

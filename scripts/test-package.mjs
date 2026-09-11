@@ -7,10 +7,11 @@ import { fileURLToPath } from 'node:url';
 
 const executeFile = promisify(execFile);
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const packageOutputDirectory = process.env.SQLX_PACKAGE_OUTPUT
+  ? path.resolve(projectRoot, process.env.SQLX_PACKAGE_OUTPUT)
+  : path.join(projectRoot, 'out', 'release');
 const executable = path.join(
-  projectRoot,
-  'out',
-  'release',
+  packageOutputDirectory,
   'SQLExplorer-win32-x64',
   'SQLExplorer.exe',
 );
@@ -30,13 +31,14 @@ if (!resolvedTestData.startsWith(`${tempRoot}${path.sep}`)) {
 }
 
 try {
+  const environment = {
+    ...process.env,
+    SQLX_CONFIG_ROOT: projectRoot,
+    SQLX_TEST_USER_DATA: testUserData,
+  };
   const { stdout } = await executeFile(executable, ['--smoke-test'], {
     cwd: path.dirname(executable),
-    env: {
-      ...process.env,
-      SQLX_CONFIG_ROOT: projectRoot,
-      SQLX_TEST_USER_DATA: testUserData,
-    },
+    env: environment,
     timeout: 30_000,
     windowsHide: true,
   });
@@ -44,6 +46,20 @@ try {
     throw new Error(`Packaged smoke marker is missing. Output: ${stdout}`);
   }
   console.log(stdout.trim());
+  if (process.env.SQLX_SKIP_DATABASE_TEST !== '1') {
+    const databaseTest = await executeFile(executable, ['--database-test'], {
+      cwd: path.dirname(executable),
+      env: environment,
+      timeout: 90_000,
+      windowsHide: true,
+    });
+    if (!databaseTest.stdout.includes('DATABASE_SELF_TEST_OK')
+      || !databaseTest.stdout.includes('sysdba=passed')
+      || !databaseTest.stdout.includes('reconnect=passed')) {
+      throw new Error(`Packaged database marker is incomplete. Output: ${databaseTest.stdout}`);
+    }
+    console.log(databaseTest.stdout.trim());
+  }
 } finally {
   fs.rmSync(resolvedTestData, { recursive: true, force: true });
 }

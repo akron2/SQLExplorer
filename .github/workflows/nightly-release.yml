@@ -30,9 +30,20 @@ jobs:
       - name: Build app (Windows)
         run: npm run package
 
+      - name: Smoke-test packaged application
+        env:
+          SQLX_SKIP_DATABASE_TEST: '1'
+        run: npm run test:package
+
       - name: Zip Windows build
         run: |
           Compress-Archive -Path "out/release/*" -DestinationPath "SQLExplorer-Windows-nightly.zip" -Force
+
+      - name: Move nightly tag to this commit
+        shell: pwsh
+        run: |
+          git tag --force nightly "${{ github.sha }}"
+          git push origin refs/tags/nightly --force
 
       - name: Publish nightly release
         uses: softprops/action-gh-release@v2
@@ -46,4 +57,3 @@ jobs:
           files: SQLExplorer-Windows-nightly.zip
           fail_on_unmatched_files: false
           overwrite_files: true
-          append_body: true

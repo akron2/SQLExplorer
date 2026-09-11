@@ -99,6 +99,7 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
   const onExecuteRef = useRef(onExecute);
   const initialThemeRef = useRef(theme);
   const viewStates = useRef(new Map<string, monaco.editor.ICodeEditorViewState>());
+  const applyingExternalText = useRef(false);
 
   metadataRef.current = metadata;
   onChangeRef.current = onChange;
@@ -195,6 +196,7 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
     }
 
     const changeDisposable = editor.onDidChangeModelContent(() => {
+      if (applyingExternalText.current) return;
       const model = editor.getModel();
       if (model) onChangeRef.current(activeDocumentRef.current.id, model.getValue());
     });
@@ -298,6 +300,19 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
     }
     editor.focus();
   }, [document]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor || activeDocumentRef.current.id !== document.id) return;
+    const model = editor.getModel();
+    if (!model || model.getValue() === document.text) return;
+    applyingExternalText.current = true;
+    try {
+      model.setValue(document.text);
+    } finally {
+      applyingExternalText.current = false;
+    }
+  }, [document.id, document.text]);
 
   useEffect(() => {
     monaco.editor.setTheme(theme === 'dark' ? 'sqlexplorer-dark' : 'sqlexplorer-light');

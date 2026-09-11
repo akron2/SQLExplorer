@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import { CheckCircle2, Clipboard, Download, LoaderCircle, TriangleAlert } from 'lucide-react';
 import { DataGrid, type Column, type RenderHeaderCellProps } from 'react-data-grid';
 import 'react-data-grid/lib/styles.css';
-import type { CellValue, ExecutionStatus, QueryColumn, QueryRow } from '../../shared/contracts';
+import type { CellValue, ExecutionStatus, QueryColumn, QueryRow, TransactionState } from '../../shared/contracts';
 
 export interface DocumentResult {
   columns: QueryColumn[];
@@ -13,7 +13,7 @@ export interface DocumentResult {
   message: string;
   rows: QueryRow[];
   status: ExecutionStatus;
-  transactionState: 'clean' | 'changed' | 'unknown';
+  transactionState: TransactionState;
 }
 
 interface ResultPanelProps {

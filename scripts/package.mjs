@@ -6,7 +6,9 @@ import { packager } from '@electron/packager';
 import { buildApplication } from './build.mjs';
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const outputDirectory = path.join(projectRoot, 'out', 'release');
+const outputDirectory = process.env.SQLX_PACKAGE_OUTPUT
+  ? path.resolve(projectRoot, process.env.SQLX_PACKAGE_OUTPUT)
+  : path.join(projectRoot, 'out', 'release');
 
 await buildApplication();
 

@@ -1,7 +1,7 @@
 {
   "name": "sqlexplorer",
   "productName": "SQLExplorer",
-  "version": "0.1.0",
+  "version": "0.1.6",
   "description": "Cross-platform Oracle and PostgreSQL desktop client",
   "main": ".vite/build/main.js",
   "private": true,
@@ -30,6 +30,8 @@
   "author": "SQLExplorer contributors",
   "license": "MIT",
   "dependencies": {
+    "chardet": "2.2.0",
+    "iconv-lite": "0.7.3",
     "oracledb": "7.0.1",
     "pg": "8.23.0",
     "pg-cursor": "2.22.0"
@@ -41,8 +43,8 @@
     "@playwright/test": "1.63.0",
     "@testing-library/jest-dom": "7.0.1",
     "@testing-library/react": "16.3.3",
-    "@types/oracledb": "7.0.3",
     "@types/node": "24.13.3",
+    "@types/oracledb": "7.0.3",
     "@types/pg": "8.23.1",
     "@types/pg-cursor": "2.7.2",
     "@types/react": "19.2.18",
