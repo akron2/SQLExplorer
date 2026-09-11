@@ -27,7 +27,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 24.21.0
           cache: npm
 
       - name: Install dependencies
@@ -38,13 +38,20 @@ jobs:
         shell: pwsh
         run: |
           if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
-            "tag=${{ github.event.inputs.tag }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "tag=${{ github.event.inputs.tag }}" | Add-Content -Path $env:GITHUB_OUTPUT
           } else {
-            "tag=$($env:GITHUB_REF -replace '^refs/tags/', '')" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "tag=$($env:GITHUB_REF -replace '^refs/tags/', '')" | Add-Content -Path $env:GITHUB_OUTPUT
           }
 
       - name: Build app (Windows)
         run: npm run package
+
+      - name: Check packaged files after build
+        run: |
+          if (!(Test-Path out/release)) {
+            Write-Error "Directory out/release not found."
+          }
+          Get-ChildItem -Recurse out/release | ForEach-Object { Write-Output $_.FullName }
 
       - name: Zip Windows build
         shell: pwsh
