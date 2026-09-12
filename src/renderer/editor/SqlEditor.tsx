@@ -258,7 +258,8 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
           cursorOffset,
         }).then((result) => {
           if (sequence !== requestSequence.current) return { suggestions: [] };
-          return { suggestions: result.items.map((item) => toSuggestion(item, model, windowBase)) };
+          const items = result?.items ?? [];
+          return { suggestions: items.map((item) => toSuggestion(item, model, windowBase)) };
         }).catch(() => ({ suggestions: [] }));
       },
     });

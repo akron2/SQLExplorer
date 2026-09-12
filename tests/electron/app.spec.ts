@@ -1,10 +1,21 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { _electron as electron, expect, test } from '@playwright/test';
+import { _electron as electron, expect, test, type ElectronApplication } from '@playwright/test';
 import iconv from 'iconv-lite';
 
 const projectRoot = process.cwd();
+
+async function stopApplication(application: ElectronApplication): Promise<void> {
+  const child = application.process();
+  if (child.exitCode !== null) return;
+  const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+  await application.evaluate(({ app }) => app.exit(0)).catch(() => undefined);
+  await Promise.race([
+    exited,
+    new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+  ]);
+}
 
 test('starts the Electron shell and executes against both live databases', async ({ browserName: _browserName }, testInfo) => {
   const application = await electron.launch({
@@ -36,6 +47,13 @@ test('starts the Electron shell and executes against both live databases', async
     await page.getByRole('button', { name: /Выполнить/u }).click();
     await expect(page.getByText('Alex Demo')).toBeVisible();
     await expect(page.locator('.server-status')).toHaveClass(/connected/u);
+
+    await editor.click();
+    await page.keyboard.press('Control+A');
+    await page.keyboard.insertText('select * from EMP');
+    await page.keyboard.press('Control+Space');
+    await expect(page.locator('.suggest-widget.visible')).toContainText('EMPLOYEES');
+    await page.keyboard.press('Escape');
 
     await page.getByRole('button', { name: /PostgreSQL local/u }).first().click();
     await page.getByRole('button', { name: 'Новый SQL-документ' }).click();
@@ -69,7 +87,7 @@ test('starts the Electron shell and executes against both live databases', async
     await expect(page.getByTestId('sql-editor')).toBeVisible();
     await page.screenshot({ path: testInfo.outputPath('electron-workspace.png') });
   } finally {
-    await application.evaluate(({ app }) => app.exit(0)).catch(() => undefined);
+    await stopApplication(application);
   }
 });
 
@@ -105,7 +123,7 @@ test('restores an Electron window with 100 documents and one editor', async ({ b
     await expect(page.getByTestId('sql-editor')).toBeVisible();
     expect(Date.now() - startedAt).toBeLessThan(2_000);
   } finally {
-    await application.evaluate(({ app }) => app.exit(0)).catch(() => undefined);
+    await stopApplication(application);
   }
 });
 
@@ -140,7 +158,7 @@ test('persists a UI-created profile while keeping its password out of plaintext 
     await expect(savedCard.locator('.connection-runtime')).toHaveClass(/disconnected/u);
     await expect(savedCard).toContainText('Не подключено');
   } finally {
-    await first.evaluate(({ app }) => app.exit(0)).catch(() => undefined);
+    await stopApplication(first);
   }
 
   const databasePath = path.join(userData, 'sqlexplorer.sqlite');
@@ -167,7 +185,7 @@ test('persists a UI-created profile while keeping its password out of plaintext 
     await dialog.getByRole('button', { name: 'Сохранить', exact: true }).click();
     await expect(page.locator('.connection-main').filter({ hasText: 'Reports edited' })).toBeVisible();
   } finally {
-    await second.evaluate(({ app }) => app.exit(0)).catch(() => undefined);
+    await stopApplication(second);
   }
 });
 
@@ -219,7 +237,7 @@ test('opens and saves a Windows-1251 SQL file through visible controls', async (
     await comparison.getByRole('button', { name: 'Вернуться к выбору' }).click();
     await conflict.getByRole('button', { name: 'Отмена' }).click();
   } finally {
-    await application.evaluate(({ app }) => app.exit(0)).catch(() => undefined);
+    await stopApplication(application);
   }
 });
 
@@ -255,7 +273,7 @@ test('saves a dirty document from the application close guard', async ({ browser
     expect(fs.readFileSync(savedPath, 'utf8')).toBe('select 123;');
   } finally {
     if (!closedByGuard) {
-      await application.evaluate(({ app }) => app.exit(0)).catch(() => undefined);
+      await stopApplication(application);
     }
   }
 });
@@ -305,7 +323,7 @@ test('shows a lost PostgreSQL session and reconnects on the next explicit execut
     await expect(page.locator('.rdg')).toContainText('42');
     await expect(serverStatus).toHaveClass(/connected/u);
   } finally {
-    await application.evaluate(({ app }) => app.exit(0)).catch(() => undefined);
+    await stopApplication(application);
   }
 });
 
@@ -333,7 +351,7 @@ test('persists interface scale and editor font size across restarts', async ({ b
     await dialog.getByRole('button', { name: 'Готово' }).click();
     await page.waitForTimeout(600);
   } finally {
-    await first.evaluate(({ app }) => app.exit(0)).catch(() => undefined);
+    await stopApplication(first);
   }
 
   const second = await launch();
@@ -347,6 +365,6 @@ test('persists interface scale and editor font size across restarts', async ({ b
     await expect(dialog.getByRole('radio', { name: '150%' })).toHaveAttribute('aria-checked', 'true');
     await expect(dialog.locator('.font-size-value')).toHaveText('15px');
   } finally {
-    await second.evaluate(({ app }) => app.exit(0)).catch(() => undefined);
+    await stopApplication(second);
   }
 });

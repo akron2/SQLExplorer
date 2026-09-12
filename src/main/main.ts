@@ -432,7 +432,7 @@ function registerIpc(): void {
       request.schema,
     );
   });
-  handle(IPC_CHANNELS.catalogComplete, async (_event, request: SqlCompletionRequest): Promise<SqlCompletionResult> => {
+  databaseHandle(IPC_CHANNELS.catalogComplete, async (_event, request: SqlCompletionRequest): Promise<SqlCompletionResult> => {
     try {
       const services = requireServices();
       let fallback: CatalogAccessContext | undefined;

@@ -74,6 +74,7 @@ export class WorkspaceStore {
     this.#databasePath = databasePath;
     this.#database = new DatabaseSync(databasePath);
     this.#database.exec(`
+      PRAGMA busy_timeout = 5000;
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = NORMAL;
       PRAGMA foreign_keys = ON;

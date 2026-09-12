@@ -86,6 +86,7 @@ SQLExplorer остаётся Electron/React/TypeScript-приложением с
 | Browser E2E | 7 сценариев проходят, включая каталог схем, поиск объектов и смену текущей схемы |
 | Electron E2E | 6 сценариев проходят: живые БД, 100 документов, profile persistence/safeStorage, Windows-1251, close guard и reconnect UI |
 | Каталог 200 тыс. объектов | префиксный поиск в SQLite укладывается в бюджет модульного теста (500 мс, фактически миллисекунды) |
+| Автодополнение в Electron | после подключения `Ctrl+Space` показывает объекты схемы (`EMPLOYEES` на живом Oracle) |
 | Oracle 21c XE Thin | basic, TNS alias, custom connect string, словари, PUBLIC синонимы, `SYS`, paging, rollback, cancel проходят |
 | Oracle 21c XE Thick / Client 19.32 | basic, TNS alias, custom connect string и запросы проходят |
 | Oracle SYSDBA | Thin и Thick проходят с локальным test secret |
