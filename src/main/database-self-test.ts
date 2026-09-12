@@ -69,12 +69,24 @@ export async function runDatabaseSelfTest(
   ]);
   assert(oracleConnection.serverVersion && postgresConnection.serverVersion, 'Server version is missing');
 
-  const metadata = await Promise.all([
-    runtime.refreshMetadata(oracle),
-    runtime.refreshMetadata(postgres),
+  const [oracleOverview, postgresOverview] = await Promise.all([
+    runtime.catalogOverview(oracle),
+    runtime.catalogOverview(postgres),
   ]);
-  assert(metadata[0].objects.some((object) => object.name === 'EMPLOYEES'), 'Oracle metadata is incomplete');
-  assert(metadata[1].objects.some((object) => object.name === 'employees'), 'PostgreSQL metadata is incomplete');
+  assert(oracleOverview.currentSchema && oracleOverview.schemas.includes('SQLX'), 'Oracle catalog overview is incomplete');
+  assert(postgresOverview.currentSchema, 'PostgreSQL catalog overview is incomplete');
+  const oracleObjects = await runtime.listObjects(oracle, {
+    schema: oracleOverview.currentSchema, prefix: 'EMP', caseSensitive: false, limit: 50,
+  });
+  assert(oracleObjects.objects.some((object) => object.name === 'EMPLOYEES'), 'Oracle catalog objects are incomplete');
+  const oracleColumns = await runtime.listColumns(oracle, oracleOverview.currentSchema, 'EMPLOYEES');
+  assert(oracleColumns.some((column) => column.name === 'EMPLOYEE_ID'), 'Oracle catalog columns are incomplete');
+  const postgresObjects = await runtime.listObjects(postgres, {
+    schema: 'public', prefix: 'emp', caseSensitive: false, limit: 50,
+  });
+  assert(postgresObjects.objects.some((object) => object.name === 'employees'), 'PostgreSQL catalog objects are incomplete');
+  const postgresColumns = await runtime.listColumns(postgres, 'public', 'employees');
+  assert(postgresColumns.some((column) => column.name === 'employee_id'), 'PostgreSQL catalog columns are incomplete');
 
   const oracleDocument = 'integration-oracle-thin';
   const oraclePage = await execute(runtime, oracle, oracleDocument, 'select employee_id, full_name from employees order by employee_id');
@@ -87,6 +99,24 @@ export async function runDatabaseSelfTest(
   assert(postgresPage.rows.length === 2 && postgresPage.hasMore, 'PostgreSQL paging did not return the first page');
   const postgresNext = await runtime.fetchMore({ executionId: postgresPage.executionId, pageSize: 2 });
   assert(postgresNext.rows.length === 1, 'PostgreSQL paging did not return the remaining row');
+
+  const oraclePublicSynonyms = await runtime.listObjects(oracle, {
+    schema: 'PUBLIC', prefix: 'DUA', caseSensitive: false, limit: 10,
+  });
+  assert(oraclePublicSynonyms.objects.some((object) => object.name === 'DUAL'), 'Oracle PUBLIC synonyms are not visible');
+  const oracleSystemSchema = await runtime.listObjects(oracle, {
+    schema: 'SYS', prefix: 'USER_TABLES', caseSensitive: false, limit: 10,
+  });
+  assert(oracleSystemSchema.objects.some((object) => object.name === 'USER_TABLES'), 'Oracle sys. objects are not visible');
+
+  const postgresSessionContext = await runtime.sessionContext(postgres, {
+    connectionId: postgres.id, documentId: postgresDocument,
+  });
+  assert(postgresSessionContext?.currentSchema === 'public', 'PostgreSQL session context is incomplete');
+  const switchedContext = await runtime.setSessionSchema(postgres, {
+    connectionId: postgres.id, documentId: postgresDocument, schema: 'public',
+  });
+  assert(switchedContext?.searchPath.includes('public'), 'PostgreSQL search_path did not switch to the requested schema');
 
   await execute(runtime, oracle, oracleDocument, "insert into departments (department_id, department_name) values (9999, 'Rollback probe')");
   await runtime.rollback(oracle, { connectionId: oracle.id, documentId: oracleDocument });

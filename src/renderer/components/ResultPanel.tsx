@@ -21,6 +21,7 @@ interface ResultPanelProps {
   onExport(): void;
   onFetchMore(): void;
   result: DocumentResult;
+  scale: number;
   theme: 'light' | 'dark';
 }
 
@@ -40,7 +41,7 @@ function Header({ column }: RenderHeaderCellProps<QueryRow>) {
   );
 }
 
-export function ResultPanel({ onCopy, onExport, onFetchMore, result, theme }: ResultPanelProps) {
+export function ResultPanel({ onCopy, onExport, onFetchMore, result, scale, theme }: ResultPanelProps) {
   const columns = useMemo<Column<QueryRow>[]>(() => [
     {
       key: '__index',
@@ -109,8 +110,8 @@ export function ResultPanel({ onCopy, onExport, onFetchMore, result, theme }: Re
             columns={columns}
             rows={result.rows}
             rowKeyGetter={(row: QueryRow) => row.index}
-            rowHeight={35}
-            headerRowHeight={54}
+            rowHeight={Math.round(35 * scale)}
+            headerRowHeight={Math.round(54 * scale)}
           />
         ) : (
           <div className="result-message empty-result">

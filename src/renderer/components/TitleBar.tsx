@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import { ChevronDown, FilePlus2, FolderOpen, Moon, PanelLeft, Save, Sun } from 'lucide-react';
+import { ChevronDown, FilePlus2, FolderOpen, Moon, PanelLeft, Save, Sun, Type } from 'lucide-react';
 import type { FileCommand, RecentSqlFile } from '../../shared/contracts';
 
 interface TitleBarProps {
   explorerVisible: boolean;
   onFileCommand(command: FileCommand): void;
+  onOpenAppearance(): void;
   onOpenRecent(filePath: string): void;
   onRequestRecent(): void;
   onToggleExplorer(): void;
@@ -16,6 +17,7 @@ interface TitleBarProps {
 export function TitleBar({
   explorerVisible,
   onFileCommand,
+  onOpenAppearance,
   onOpenRecent,
   onRequestRecent,
   onToggleExplorer,
@@ -69,6 +71,7 @@ export function TitleBar({
       </div>
       <span className="workspace-label">Рабочая область</span>
       <div className="title-actions">
+        <button className="icon-button" type="button" onClick={onOpenAppearance} title="Вид и шрифт" aria-label="Вид и шрифт"><Type size={16} /></button>
         <button className={`icon-button ${explorerVisible ? 'is-active' : ''}`} type="button" onClick={onToggleExplorer} title={explorerVisible ? 'Скрыть проводник' : 'Показать проводник'} aria-label={explorerVisible ? 'Скрыть проводник' : 'Показать проводник'}><PanelLeft size={16} /></button>
         <button className="icon-button" type="button" onClick={onToggleTheme} title={theme === 'dark' ? 'Светлая тема' : 'Тёмная тема'} aria-label={theme === 'dark' ? 'Светлая тема' : 'Тёмная тема'}>{theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}</button>
       </div>

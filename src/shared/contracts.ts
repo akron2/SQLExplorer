@@ -62,6 +62,7 @@ export interface SqlDocument {
   eol: TextFileEol;
   filePath?: string;
   id: string;
+  schema?: string;
   text: string;
   title: string;
   updatedAt: string;
@@ -75,7 +76,7 @@ export interface WorkspaceSnapshot {
   explorerConnectionId: string | null;
   explorerVisible: boolean;
   resultPanelHeight: number;
-  schemaVersion: 2;
+  schemaVersion: 3;
   theme: ThemePreference;
 }
 
@@ -147,6 +148,19 @@ export interface OracleSettings {
   defaultNetConfigDir: string;
 }
 
+export const UI_SCALE_STEPS = [0.9, 1, 1.1, 1.25, 1.5] as const;
+
+export type InterfaceScale = (typeof UI_SCALE_STEPS)[number];
+
+export const EDITOR_FONT_SIZE_MIN = 11;
+export const EDITOR_FONT_SIZE_MAX = 24;
+export const EDITOR_FONT_SIZE_DEFAULT = 14;
+
+export interface UiSettings {
+  editorFontSize: number;
+  interfaceScale: InterfaceScale;
+}
+
 export interface ConnectionTestRequest {
   connectionId?: string;
   profile?: ConnectionProfileInput;
@@ -163,6 +177,7 @@ export interface SessionRequest {
   connectionId: string;
   documentId: string;
   force?: boolean;
+  schema?: string;
 }
 
 export interface SessionState {
@@ -184,26 +199,128 @@ export interface DatabaseErrorInfo {
   retryable: boolean;
 }
 
-export interface MetadataColumn {
+export type CatalogObjectKind =
+  | 'table'
+  | 'view'
+  | 'matview'
+  | 'package'
+  | 'sequence'
+  | 'synonym'
+  | 'function'
+  | 'procedure'
+  | 'type';
+
+export interface CatalogColumn {
   dataType: string;
   name: string;
   nullable: boolean;
   position: number;
 }
 
-export interface MetadataObject {
-  columns?: MetadataColumn[];
-  kind: 'table' | 'view' | 'package' | 'sequence' | 'synonym' | 'function';
+export interface CatalogObjectSummary {
+  kind: CatalogObjectKind;
   name: string;
   schema: string;
 }
 
-export interface MetadataSnapshot {
+export interface CatalogSchemaSummary {
+  isDefault: boolean;
+  loaded: boolean;
+  name: string;
+  objectCount: number;
+  stale: boolean;
+}
+
+export interface CatalogAccessContext {
   connectionId: string;
+  currentSchema: string;
   fetchedAt: string;
-  objects: MetadataObject[];
+  searchPath: string[];
+  source: 'session' | 'catalog' | 'default';
+  userName: string;
+}
+
+export type CatalogPhase = 'unavailable' | 'loading' | 'ready' | 'error';
+
+export interface CatalogConnectionState {
+  connectionId: string;
+  error?: string;
+  loadedSchemas: number;
+  phase: CatalogPhase;
+  totalSchemas: number;
+  updatedAt: string;
+}
+
+export interface CatalogListRequest {
+  connectionId: string;
+  kind: 'schemas' | 'objects';
+  limit?: number;
+  objectKinds?: CatalogObjectKind[];
+  offset?: number;
+  schema?: string;
+  search?: string;
+}
+
+export interface CatalogListResult {
+  hasMore: boolean;
+  objects?: CatalogObjectSummary[];
+  schemas?: CatalogSchemaSummary[];
+  total: number;
+}
+
+export interface CatalogRefreshRequest {
+  connectionId: string;
+  schema?: string;
+}
+
+export interface CatalogContextRequest {
+  connectionId: string;
+  documentId: string;
+}
+
+export interface SetSessionSchemaRequest {
+  connectionId: string;
+  documentId: string;
   schema: string;
-  stale?: boolean;
+}
+
+export type CompletionItemKind =
+  | 'alias'
+  | 'column'
+  | 'cte'
+  | 'function'
+  | 'keyword'
+  | 'matview'
+  | 'package'
+  | 'procedure'
+  | 'schema'
+  | 'sequence'
+  | 'synonym'
+  | 'table'
+  | 'type'
+  | 'view';
+
+export interface SqlCompletionRequest {
+  connectionId: string | null;
+  cursorOffset: number;
+  dialect: SqlDialect;
+  documentId: string;
+  textWindow: string;
+}
+
+export interface SqlCompletionItem {
+  detail?: string;
+  kind: CompletionItemKind;
+  replaceEnd: number;
+  replaceStart: number;
+  sortText: string;
+  text: string;
+}
+
+export interface SqlCompletionResult {
+  incomplete: boolean;
+  items: SqlCompletionItem[];
+  source: 'cache' | 'database' | 'none';
 }
 
 export type CellValue = boolean | number | string | null;
@@ -238,6 +355,7 @@ export interface ExecuteRequest {
   executionId: string;
   pageSize: number;
   parameters?: Record<string, CellValue>;
+  schema?: string;
   sql: string;
 }
 
@@ -309,11 +427,11 @@ export type ConnectionMenuAction =
 
 export interface BootstrapPayload {
   connections: PublicConnectionProfile[];
-  metadata: MetadataSnapshot[];
   oracleClients: OracleClientDefinition[];
   oracleSettings: OracleSettings;
   platform: NodeJS.Platform | 'browser';
   sessionStates: SessionState[];
+  uiSettings: UiSettings;
   version: string;
   workspace: WorkspaceSnapshot;
 }
@@ -328,6 +446,10 @@ export interface AppMetric {
 export interface SQLExplorerApi {
   bootstrap(): Promise<BootstrapPayload>;
   cancel(executionId: string): Promise<boolean>;
+  catalogComplete(request: SqlCompletionRequest): Promise<SqlCompletionResult>;
+  catalogContext(request: CatalogContextRequest): Promise<CatalogAccessContext>;
+  catalogList(request: CatalogListRequest): Promise<CatalogListResult>;
+  catalogRefresh(request: CatalogRefreshRequest): Promise<CatalogConnectionState>;
   chooseDirectory(defaultPath?: string): Promise<string | undefined>;
   commit(request: TransactionRequest): Promise<void>;
   connect(request: SessionRequest): Promise<SessionState>;
@@ -339,13 +461,13 @@ export interface SQLExplorerApi {
   getRecentSqlFiles(): Promise<RecentSqlFile[]>;
   confirmAppClose(allow: boolean): Promise<void>;
   onBeforeAppClose(listener: () => void): () => void;
+  onCatalogStateChanged(listener: (state: CatalogConnectionState) => void): () => void;
   listTnsAliases(configDir: string): Promise<string[]>;
   onFileCommand(listener: (command: FileCommand) => void): () => void;
   onSessionStateChanged(listener: (state: SessionState) => void): () => void;
   openDroppedFiles(files: File[]): Promise<OpenedSqlFile[]>;
   openSqlFiles(request?: OpenSqlFilesRequest): Promise<OpenedSqlFile[]>;
   reconnect(request: SessionRequest): Promise<SessionState>;
-  refreshMetadata(connectionId: string): Promise<MetadataSnapshot>;
   reopenSqlFile(request: ReopenSqlFileRequest): Promise<OpenedSqlFile>;
   reportMetric(metric: AppMetric): void;
   rollback(request: TransactionRequest): Promise<void>;
@@ -353,7 +475,9 @@ export interface SQLExplorerApi {
   saveOracleClient(client: OracleClientInput): Promise<OracleClientDefinition>;
   saveOracleSettings(settings: OracleSettings): Promise<OracleSettings>;
   saveSqlFile(request: SaveSqlFileRequest): Promise<SaveSqlFileResult>;
+  saveUiSettings(settings: UiSettings): Promise<UiSettings>;
   saveWorkspace(snapshot: WorkspaceSnapshot): Promise<void>;
+  setSessionSchema(request: SetSessionSchemaRequest): Promise<CatalogAccessContext>;
   setTitleBarTheme(theme: 'light' | 'dark'): void;
   showConnectionMenu(connectionId: string): Promise<ConnectionMenuAction | undefined>;
   showNewDocumentMenu(): Promise<NewDocumentMenuResult | undefined>;
@@ -364,6 +488,11 @@ export const IPC_CHANNELS = {
   bootstrap: 'app:bootstrap',
   beforeAppClose: 'app:before-close',
   cancel: 'db:cancel',
+  catalogComplete: 'catalog:complete',
+  catalogContext: 'catalog:context',
+  catalogList: 'catalog:list',
+  catalogRefresh: 'catalog:refresh',
+  catalogStateChanged: 'catalog:state-changed',
   chooseDirectory: 'file:choose-directory',
   commit: 'db:commit',
   confirmAppClose: 'app:confirm-close',
@@ -378,7 +507,6 @@ export const IPC_CHANNELS = {
   listTnsAliases: 'oracle-net:list-aliases',
   openSqlFiles: 'file:open',
   reconnect: 'db:reconnect',
-  refreshMetadata: 'db:refresh-metadata',
   reopenSqlFile: 'file:reopen',
   reportMetric: 'app:metric',
   rollback: 'db:rollback',
@@ -386,8 +514,10 @@ export const IPC_CHANNELS = {
   saveOracleClient: 'oracle-client:save',
   saveOracleSettings: 'oracle-settings:save',
   saveSqlFile: 'file:save',
+  saveUiSettings: 'ui-settings:save',
   saveWorkspace: 'workspace:save',
   sessionStateChanged: 'db:session-state-changed',
+  setSessionSchema: 'catalog:set-schema',
   setTitleBarTheme: 'window:title-bar-theme',
   showConnectionMenu: 'menu:connection',
   showNewDocumentMenu: 'menu:new-document',
@@ -396,16 +526,21 @@ export const IPC_CHANNELS = {
 
 export type WorkerMethod =
   | 'cancel'
+  | 'catalogOverview'
   | 'close'
   | 'commit'
   | 'connect'
+  | 'countSchemaObjects'
   | 'disconnect'
   | 'execute'
   | 'fetchMore'
+  | 'listColumns'
+  | 'listObjects'
   | 'listTnsAliases'
   | 'reconnect'
-  | 'refreshMetadata'
   | 'rollback'
+  | 'sessionContext'
+  | 'setSessionSchema'
   | 'testConnection';
 
 export interface WorkerRequest {
@@ -436,4 +571,32 @@ export interface DatabaseRuntimeConfiguration {
   libDir?: string;
   mode?: OracleDriverMode;
   runtimeKey: string;
+}
+
+export interface CatalogOverview {
+  currentSchema: string;
+  schemas: string[];
+  searchPath: string[];
+  userName: string;
+}
+
+export interface CatalogObjectQuery {
+  caseSensitive: boolean;
+  kinds?: CatalogObjectKind[];
+  limit: number;
+  offset?: number;
+  prefix?: string;
+  schema: string;
+  substring?: boolean;
+}
+
+export interface CatalogObjectPage {
+  hasMore: boolean;
+  objects: CatalogObjectSummary[];
+}
+
+export interface SessionContextResult {
+  currentSchema: string;
+  searchPath: string[];
+  userName: string;
 }

@@ -1,26 +1,32 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   BootstrapPayload,
+  CatalogAccessContext,
+  CatalogListRequest,
+  CatalogSchemaSummary,
   CellValue,
   ConnectionMenuAction,
   ConnectionProfileInput,
   CursorPosition,
   FileCommand,
-  MetadataSnapshot,
   OpenedSqlFile,
   PublicConnectionProfile,
   QueryPage,
   RecentSqlFile,
   SessionState,
+  SqlCompletionRequest,
+  SqlCompletionResult,
   SqlDocument,
   TextFileBom,
   TextFileEol,
   ThemePreference,
+  UiSettings,
   WorkspaceSnapshot,
 } from '../shared/contracts';
-import { createPerformanceWorkspace } from '../shared/defaults';
+import { createPerformanceWorkspace, normalizeUiSettings } from '../shared/defaults';
 import { ConnectionDialog } from './components/ConnectionDialog';
 import { AppCloseDialog } from './components/AppCloseDialog';
+import { AppearanceDialog } from './components/AppearanceDialog';
 import {
   CloseDocumentDialog,
   FileComparisonDialog,
@@ -118,7 +124,9 @@ export function App() {
   const fileCommandRef = useRef<(command: FileCommand) => void>(() => undefined);
   const [bootstrap, setBootstrap] = useState<BootstrapPayload>();
   const [workspace, setWorkspace] = useState<WorkspaceSnapshot>();
-  const [metadata, setMetadata] = useState<Record<string, MetadataSnapshot>>({});
+  const [uiSettings, setUiSettings] = useState<UiSettings>();
+  const [schemas, setSchemas] = useState<Record<string, CatalogSchemaSummary[]>>({});
+  const [documentContexts, setDocumentContexts] = useState<Record<string, CatalogAccessContext>>({});
   const [results, setResults] = useState<Record<string, DocumentResult>>({});
   const [sessionStates, setSessionStates] = useState<Record<string, SessionState>>({});
   const [cursor, setCursor] = useState<CursorPosition>({ lineNumber: 1, column: 1 });
@@ -127,6 +135,7 @@ export function App() {
   const [toast, setToast] = useState<string>();
   const [connectionDialog, setConnectionDialog] = useState<ConnectionDialogState>();
   const [oracleSettingsOpen, setOracleSettingsOpen] = useState(false);
+  const [appearanceOpen, setAppearanceOpen] = useState(false);
   const [pendingCloseId, setPendingCloseId] = useState<string>();
   const [fileConflict, setFileConflict] = useState<FileConflictState>();
   const [encodingDocumentId, setEncodingDocumentId] = useState<string>();
@@ -135,6 +144,38 @@ export function App() {
   const [pendingSessionAction, setPendingSessionAction] = useState<'disconnect' | 'reconnect'>();
   const [fileComparison, setFileComparison] = useState<{ diskText: string; documentId: string }>();
   const performanceMode = useMemo(() => new URLSearchParams(location.search).get('performance') === '1', []);
+  const currentDocumentRef = useRef<SqlDocument | undefined>(undefined);
+  currentDocumentRef.current = workspace ? activeDocument(workspace) : undefined;
+
+  const loadSchemas = useCallback(async (connectionId: string) => {
+    try {
+      const result = await api.catalogList({ connectionId, kind: 'schemas', limit: 500 });
+      setSchemas((current) => ({ ...current, [connectionId]: result.schemas ?? [] }));
+    } catch {
+      // Каталог недоступен до появления соединения.
+    }
+  }, [api]);
+
+  const refreshDocumentContext = useCallback(async (document: SqlDocument) => {
+    if (!document.connectionId) return;
+    try {
+      const context = await api.catalogContext({ connectionId: document.connectionId, documentId: document.id });
+      setDocumentContexts((current) => ({ ...current, [document.id]: context }));
+    } catch {
+      // Контекст появится после подключения.
+    }
+  }, [api]);
+
+  useEffect(() => {
+    const active = currentDocumentRef.current;
+    if (!active?.connectionId) return;
+    void loadSchemas(active.connectionId);
+    void refreshDocumentContext(active);
+  }, [loadSchemas, refreshDocumentContext, workspace?.activeDocumentId]);
+
+  useEffect(() => api.onCatalogStateChanged((state) => {
+    if (state.phase === 'ready') void loadSchemas(state.connectionId);
+  }), [api, loadSchemas]);
 
   useEffect(() => {
     let active = true;
@@ -147,8 +188,8 @@ export function App() {
         ? createPerformanceWorkspace(documentCount, payloadKb)
         : payload.workspace;
       setBootstrap(payload);
-      setMetadata(Object.fromEntries(payload.metadata.map((snapshot) => [snapshot.connectionId, snapshot])));
       setSessionStates(Object.fromEntries(payload.sessionStates.map((state) => [state.documentId, state])));
+      setUiSettings(payload.uiSettings);
       setWorkspace(initialWorkspace);
       const diagnosticsWindow = window as DiagnosticsWindow;
       diagnosticsWindow.__SQLX_DIAGNOSTICS__ = {
@@ -202,6 +243,20 @@ export function App() {
     globalThis.document.documentElement.dataset.theme = resolvedTheme;
     api.setTitleBarTheme(resolvedTheme);
   }, [api, resolvedTheme]);
+
+  useEffect(() => {
+    if (!uiSettings) return;
+    globalThis.document.documentElement.style.setProperty('--ui-scale', String(uiSettings.interfaceScale));
+  }, [uiSettings]);
+
+  useEffect(() => {
+    if (!uiSettings || performanceMode) return;
+    const timeout = window.setTimeout(() => {
+      void api.saveUiSettings(uiSettings).catch((error: unknown) =>
+        setToast(error instanceof Error ? error.message : String(error)));
+    }, 350);
+    return () => window.clearTimeout(timeout);
+  }, [api, performanceMode, uiSettings]);
 
   useEffect(() => {
     if (!workspace || performanceMode) return;
@@ -394,9 +449,11 @@ export function App() {
     try {
       const page = await api.execute({
         connectionId: document.connectionId, documentId: document.id,
-        executionId, pageSize: 300, sql,
+        executionId, pageSize: 300, sql, schema: document.schema,
       });
       setResults((current) => ({ ...current, [document.id]: resultFromPage(page) }));
+      void refreshDocumentContext(document);
+      void loadSchemas(document.connectionId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const kind = error && typeof error === 'object' && 'kind' in error ? String(error.kind) : 'unknown';
@@ -411,7 +468,7 @@ export function App() {
         },
       }));
     }
-  }, [api, bootstrap, workspace]);
+  }, [api, bootstrap, loadSchemas, refreshDocumentContext, workspace]);
 
   const cancel = async () => {
     if (!currentDocument || !result.executionId) return;
@@ -450,7 +507,22 @@ export function App() {
   const connect = async (mode: 'connect' | 'reconnect' | 'disconnect') => {
     if (!currentDocument?.connectionId) return;
     try {
-      await api[mode]({ connectionId: currentDocument.connectionId, documentId: currentDocument.id });
+      await api[mode]({
+        connectionId: currentDocument.connectionId,
+        documentId: currentDocument.id,
+        schema: currentDocument.schema,
+      });
+      if (mode === 'disconnect') {
+        setDocumentContexts((current) => {
+          const next = { ...current };
+          delete next[currentDocument.id];
+          return next;
+        });
+        void refreshDocumentContext(currentDocument);
+      } else {
+        void refreshDocumentContext(currentDocument);
+        void loadSchemas(currentDocument.connectionId);
+      }
     } catch (error) {
       if ((mode === 'disconnect' || mode === 'reconnect')
         && error && typeof error === 'object' && 'kind' in error && error.kind === 'transaction') {
@@ -482,24 +554,57 @@ export function App() {
       delete next[currentDocument.id];
       return next;
     });
+    setDocumentContexts((current) => {
+      const next = { ...current };
+      delete next[currentDocument.id];
+      return next;
+    });
+    if (selected) {
+      void refreshDocumentContext({
+        ...currentDocument,
+        connectionId: selected.id,
+        dialect: selected.kind,
+      });
+      void loadSchemas(selected.id);
+    }
   };
 
-  const refreshMetadata = async () => {
+  const refreshCatalog = async (schema?: string) => {
     if (!workspace?.explorerConnectionId) {
       setToast('Выберите соединение');
       return;
     }
+    const connectionId = workspace.explorerConnectionId;
     setRefreshing(true);
     try {
-      const snapshot = await api.refreshMetadata(workspace.explorerConnectionId);
-      setMetadata((current) => ({ ...current, [snapshot.connectionId]: snapshot }));
-      setToast(`Метаданные ${snapshot.schema}: ${snapshot.objects.length} объектов`);
+      const state = await api.catalogRefresh({ connectionId, schema });
+      await loadSchemas(connectionId);
+      setToast(schema ? `Схема ${schema} обновлена` : `Каталог обновлён: схем ${state.totalSchemas}`);
     } catch (error) {
       setToast(error instanceof Error ? error.message : String(error));
     } finally {
       setRefreshing(false);
     }
   };
+
+  const changeDocumentSchema = async (schema: string) => {
+    const active = currentDocumentRef.current;
+    if (!active?.connectionId) return;
+    try {
+      const context = await api.setSessionSchema({
+        connectionId: active.connectionId,
+        documentId: active.id,
+        schema,
+      });
+      setDocumentContexts((current) => ({ ...current, [active.id]: context }));
+      setWorkspace((current) => current ? updateDocument(current, active.id, { schema }) : current);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const completeSql = useCallback((request: SqlCompletionRequest): Promise<SqlCompletionResult> =>
+    api.catalogComplete(request), [api]);
 
   const saveProfile = async (input: ConnectionProfileInput) => {
     const profile = await api.saveConnection(input);
@@ -546,11 +651,14 @@ export function App() {
           ? { ...document, connectionId: null, dialect: 'sql' }
           : document),
       } : current);
-      setMetadata((current) => {
+      setSchemas((current) => {
         const next = { ...current };
         delete next[connectionId];
         return next;
       });
+      setDocumentContexts((current) => Object.fromEntries(
+        Object.entries(current).filter(([, context]) => context.connectionId !== connectionId),
+      ));
     } catch (error) {
       setToast(error instanceof Error ? error.message : String(error));
     }
@@ -662,8 +770,6 @@ export function App() {
     return <div className="splash-screen"><div className="app-mark large">›_</div><strong>SQLExplorer</strong><span>{toast ?? 'Подготовка рабочей области…'}</span></div>;
   }
 
-  const explorerMetadata = workspace.explorerConnectionId ? metadata[workspace.explorerConnectionId] : undefined;
-  const documentMetadata = currentDocument.connectionId ? metadata[currentDocument.connectionId] : undefined;
   const closeTarget = pendingCloseId ? workspace.documents.find((document) => document.id === pendingCloseId) : undefined;
   const closeTransactionChanged = closeTarget
     ? sessionStates[closeTarget.id]?.transactionState === 'changed'
@@ -734,6 +840,7 @@ export function App() {
       <TitleBar
         explorerVisible={workspace.explorerVisible}
         onFileCommand={(command) => fileCommandRef.current(command)}
+        onOpenAppearance={() => setAppearanceOpen(true)}
         onOpenRecent={(filePath) => { void openFiles([filePath]); }}
         onRequestRecent={() => { void api.getRecentSqlFiles().then(setRecentFiles).catch(() => setRecentFiles([])); }}
         onToggleExplorer={() => setWorkspace({ ...workspace, explorerVisible: !workspace.explorerVisible })}
@@ -743,15 +850,15 @@ export function App() {
       />
       <div className={`workbench ${workspace.explorerVisible ? '' : 'explorer-hidden'}`}>
         {workspace.explorerVisible && <Explorer
+          catalogList={(request: CatalogListRequest) => api.catalogList(request)}
           connections={connections}
-          metadata={explorerMetadata}
           nativeMenus={bootstrap.platform !== 'browser'}
           onAddConnection={() => setConnectionDialog({})}
           onConnectionAction={(connectionId, action) => { void performConnectionAction(connectionId, action); }}
           onConnectionMenu={(connectionId) => { void handleConnectionMenu(connectionId); }}
           onEditConnection={(connectionId) => setConnectionDialog({ profileId: connectionId })}
           onOpenSettings={() => setOracleSettingsOpen(true)}
-          onRefresh={() => { void refreshMetadata(); }}
+          onRefresh={(schema) => { void refreshCatalog(schema); }}
           onSelectConnection={(connectionId) => setWorkspace({ ...workspace, explorerConnectionId: connectionId })}
           refreshing={refreshing}
           selectedConnectionId={workspace.explorerConnectionId}
@@ -789,25 +896,29 @@ export function App() {
             onExecute={() => { void execute(); }}
             onReconnect={() => { void connect('reconnect'); }}
             onRollback={() => { void transact('rollback'); }}
+            onSchemaChange={(schema) => { void changeDocumentSchema(schema); }}
             onSuggestions={() => editorRef.current?.showSuggestions()}
+            schemas={connection ? schemas[connection.id] ?? [] : []}
+            currentSchema={documentContexts[currentDocument.id]?.currentSchema ?? currentDocument.schema}
           />
           <div className="editor-region">
-            <div className="editor-breadcrumb"><span>{documentMetadata?.schema ?? connection?.username ?? 'SQL'}</span><span>›</span><strong>{currentDocument.title}</strong>{currentDocument.filePath && <small title={currentDocument.filePath}>{currentDocument.filePath}</small>}{performanceMode && <b className="performance-badge">PERF · {workspace.documents.length}</b>}</div>
-            <SqlEditor ref={editorRef} document={currentDocument} metadata={documentMetadata} onChange={(documentId, text) => {
+            <div className="editor-breadcrumb"><span>{documentContexts[currentDocument.id]?.currentSchema ?? currentDocument.schema ?? connection?.username ?? 'SQL'}</span><span>›</span><strong>{currentDocument.title}</strong>{currentDocument.filePath && <small title={currentDocument.filePath}>{currentDocument.filePath}</small>}{performanceMode && <b className="performance-badge">PERF · {workspace.documents.length}</b>}</div>
+            <SqlEditor ref={editorRef} complete={completeSql} document={currentDocument} editorFontSize={uiSettings?.editorFontSize ?? 14} onChange={(documentId, text) => {
               const current = workspace.documents.find((candidate) => candidate.id === documentId);
               if (current?.text === text) return;
               setWorkspace((value) => value ? updateDocument(value, documentId, { text, dirty: true }) : value);
-            }} onCursorChange={setCursor} onExecute={() => { void execute(); }} theme={resolvedTheme} />
+            }} onCursorChange={setCursor} onEditorFontSizeChange={(editorFontSize) => setUiSettings((current) => normalizeUiSettings({ ...current, editorFontSize }))} onExecute={() => { void execute(); }} theme={resolvedTheme} />
             <div className="editor-footnote">{currentDocument.dialect === 'oracle' ? 'Oracle SQL' : currentDocument.dialect === 'postgres' ? 'PostgreSQL' : 'SQL'} · {currentDocument.encoding.toUpperCase()} · {currentDocument.eol.toUpperCase()}</div>
           </div>
           <div className="result-resizer" onPointerDown={resizeResult} role="separator" aria-orientation="horizontal" />
-          <ResultPanel onCopy={copy} onExport={exportCsv} onFetchMore={() => { void fetchMore(); }} result={result} theme={resolvedTheme} />
+          <ResultPanel onCopy={copy} onExport={exportCsv} onFetchMore={() => { void fetchMore(); }} result={result} scale={uiSettings?.interfaceScale ?? 1} theme={resolvedTheme} />
         </main>
       </div>
       <StatusBar connection={connection} cursor={cursor} document={currentDocument} documentCount={workspace.documents.length} onChangeEol={(eol: TextFileEol) => { if (eol !== currentDocument.eol) setWorkspace(updateDocument(workspace, currentDocument.id, { eol, dirty: true })); }} onOpenEncoding={() => setEncodingDocumentId(currentDocument.id)} session={session} transactionChanged={session?.transactionState === 'changed' || result.transactionState === 'changed'} />
 
       {connectionDialog && <ConnectionDialog key={connectionDialog.profileId ?? 'new'} profile={editProfile} oracleClients={bootstrap.oracleClients} oracleSettings={bootstrap.oracleSettings} onChooseDirectory={api.chooseDirectory} onClose={() => setConnectionDialog(undefined)} onListTnsAliases={api.listTnsAliases} onOpenOracleSettings={() => setOracleSettingsOpen(true)} onSave={saveProfile} onTest={(input) => api.testConnection({ profile: input })} />}
       {oracleSettingsOpen && <OracleSettingsDialog clients={bootstrap.oracleClients} settings={bootstrap.oracleSettings} onChooseDirectory={api.chooseDirectory} onClose={() => setOracleSettingsOpen(false)} onSaveSettings={async (settings) => { await api.saveOracleSettings(settings); await reloadConnectionConfiguration(); }} onSaveClient={async (input) => { await api.saveOracleClient(input); await reloadConnectionConfiguration(); }} onDeleteClient={async (id) => { await api.deleteOracleClient(id); await reloadConnectionConfiguration(); }} />}
+      {appearanceOpen && uiSettings && <AppearanceDialog editorFontSize={uiSettings.editorFontSize} interfaceScale={uiSettings.interfaceScale} onChangeEditorFontSize={(editorFontSize) => setUiSettings((current) => normalizeUiSettings({ ...current, editorFontSize }))} onChangeInterfaceScale={(interfaceScale) => setUiSettings((current) => normalizeUiSettings({ ...current, interfaceScale }))} onClose={() => setAppearanceOpen(false)} />}
       {closeTarget && <CloseDocumentDialog document={closeTarget} transactionChanged={closeTransactionChanged} onCancel={() => setPendingCloseId(undefined)} onCommit={() => { void transact('commit', closeTarget).then((done) => { if (done && !closeTarget.dirty) void finishClose(closeTarget.id); }); }} onRollback={() => { void transact('rollback', closeTarget).then((done) => { if (done && !closeTarget.dirty) void finishClose(closeTarget.id); }); }} onDiscard={() => { void discardAndClose(closeTarget); }} onSave={() => { void saveDocument(closeTarget.id).then((saved) => { if (saved) void finishClose(closeTarget.id); }); }} />}
       {conflictTarget && <FileConflictDialog document={conflictTarget} onCancel={() => setFileConflict(undefined)} onCompare={() => { if (!conflictTarget.filePath) return; void api.reopenSqlFile({ filePath: conflictTarget.filePath, encoding: conflictTarget.encoding }).then((opened) => setFileComparison({ documentId: conflictTarget.id, diskText: opened.text })).catch((error: unknown) => setToast(error instanceof Error ? error.message : String(error))); }} onReload={() => { if (!conflictTarget.filePath) return; void api.reopenSqlFile({ filePath: conflictTarget.filePath, encoding: conflictTarget.encoding }).then((opened) => { setWorkspace((current) => current ? updateDocument(current, conflictTarget.id, { ...openedFields(opened), dirty: false }) : current); setFileConflict(undefined); if (pendingCloseId === conflictTarget.id) void finishClose(conflictTarget.id); }).catch((error: unknown) => setToast(error instanceof Error ? error.message : String(error))); }} onSaveAs={() => { setFileConflict(undefined); void saveDocument(conflictTarget.id, true).then((saved) => { if (saved && pendingCloseId === conflictTarget.id) void finishClose(conflictTarget.id); }); }} onOverwrite={() => { setFileConflict(undefined); void saveDocument(conflictTarget.id, false, true).then((saved) => { if (saved && pendingCloseId === conflictTarget.id) void finishClose(conflictTarget.id); }); }} />}
       {fileComparison && <FileComparisonDialog document={workspace.documents.find((document) => document.id === fileComparison.documentId) ?? currentDocument} diskText={fileComparison.diskText} onClose={() => setFileComparison(undefined)} />}

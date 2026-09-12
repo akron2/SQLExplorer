@@ -1,6 +1,7 @@
 import {
   Check,
   ChevronDown,
+  Database,
   ListFilter,
   LoaderCircle,
   Play,
@@ -11,11 +12,17 @@ import {
   Square,
   Unplug,
 } from 'lucide-react';
-import type { ExecutionStatus, PublicConnectionProfile, SessionState } from '../../shared/contracts';
+import type {
+  CatalogSchemaSummary,
+  ExecutionStatus,
+  PublicConnectionProfile,
+  SessionState,
+} from '../../shared/contracts';
 
 interface ExecutionToolbarProps {
   connection?: PublicConnectionProfile;
   connections: PublicConnectionProfile[];
+  currentSchema?: string;
   onCancel(): void;
   onChangeConnection(connectionId: string | null): void;
   onCommit(): void;
@@ -24,7 +31,9 @@ interface ExecutionToolbarProps {
   onExecute(): void;
   onReconnect(): void;
   onRollback(): void;
+  onSchemaChange(schema: string): void;
   onSuggestions(): void;
+  schemas: CatalogSchemaSummary[];
   session?: SessionState;
   status: ExecutionStatus;
   transactionChanged: boolean;
@@ -42,6 +51,7 @@ const statusLabels: Record<SessionState['status'], string> = {
 export function ExecutionToolbar({
   connection,
   connections,
+  currentSchema,
   status,
   transactionChanged,
   session,
@@ -53,7 +63,9 @@ export function ExecutionToolbar({
   onExecute,
   onReconnect,
   onRollback,
+  onSchemaChange,
   onSuggestions,
+  schemas,
 }: ExecutionToolbarProps) {
   const running = ['queued', 'running', 'fetching', 'cancel-requested'].includes(status);
   const sessionStatus = session?.status ?? 'disconnected';
@@ -88,6 +100,21 @@ export function ExecutionToolbar({
         <span className={`session-dot ${sessionStatus}`} />
         <span className="session-label" title={sessionDetails}>{statusLabels[sessionStatus]}</span>
         <ChevronDown size={14} />
+      </label>
+      <label className="schema-selector" title="Текущая схема вкладки">
+        <Database size={14} />
+        <select
+          value={currentSchema ?? ''}
+          onChange={(event) => { if (event.target.value) onSchemaChange(event.target.value); }}
+          disabled={!connection || running}
+          aria-label="Текущая схема"
+        >
+          {!currentSchema && <option value="">Схема по умолчанию</option>}
+          {currentSchema && !schemas.some((schema) => schema.name === currentSchema) && (
+            <option value={currentSchema}>{currentSchema}</option>
+          )}
+          {schemas.map((schema) => <option key={schema.name} value={schema.name}>{schema.name}</option>)}
+        </select>
       </label>
     </div>
   );

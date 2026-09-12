@@ -18,34 +18,41 @@ import 'monaco-editor/editor/contrib/hover/browser/hoverContribution';
 import 'monaco-editor/editor/contrib/linesOperations/browser/linesOperations';
 import 'monaco-editor/editor/contrib/suggest/browser/suggestController';
 import 'monaco-editor/editor/contrib/wordOperations/browser/wordOperations';
-import type { CursorPosition, MetadataSnapshot, SqlDocument } from '../../shared/contracts';
+import type {
+  CursorPosition,
+  SqlCompletionItem,
+  SqlCompletionRequest,
+  SqlCompletionResult,
+  SqlDocument,
+} from '../../shared/contracts';
+import { clampEditorFontSize, editorLineHeight } from './editor-font';
 import { modelForDocument, updateEditorDiagnostics } from './editor-models';
-import { statementAtOffset } from './sql-selection';
+import { DARK_EDITOR_THEME, defineEditorThemes, LIGHT_EDITOR_THEME } from './editor-themes';
+import { statementAtOffset, statementRangeAtOffset } from './sql-selection';
 
 self.MonacoEnvironment = {
   getWorker: () => new EditorWorker(),
 };
 
-const sqlKeywords = [
-  'select',
-  'from',
-  'where',
-  'join',
-  'left join',
-  'right join',
-  'inner join',
-  'group by',
-  'order by',
-  'having',
-  'insert into',
-  'update',
-  'delete from',
-  'merge into',
-  'commit',
-  'rollback',
-  'begin',
-  'declare',
-];
+const MAX_WINDOW_CHARS = 60_000;
+const CONTEXT_BEFORE_CURSOR = 56_000;
+
+const completionKinds: Record<SqlCompletionItem['kind'], monaco.languages.CompletionItemKind> = {
+  alias: monaco.languages.CompletionItemKind.Variable,
+  column: monaco.languages.CompletionItemKind.Field,
+  cte: monaco.languages.CompletionItemKind.Struct,
+  function: monaco.languages.CompletionItemKind.Function,
+  keyword: monaco.languages.CompletionItemKind.Keyword,
+  matview: monaco.languages.CompletionItemKind.Struct,
+  package: monaco.languages.CompletionItemKind.Module,
+  procedure: monaco.languages.CompletionItemKind.Function,
+  schema: monaco.languages.CompletionItemKind.Module,
+  sequence: monaco.languages.CompletionItemKind.Value,
+  synonym: monaco.languages.CompletionItemKind.Reference,
+  table: monaco.languages.CompletionItemKind.Struct,
+  type: monaco.languages.CompletionItemKind.Class,
+  view: monaco.languages.CompletionItemKind.Struct,
+};
 
 export interface SqlEditorHandle {
   focus(): void;
@@ -54,56 +61,77 @@ export interface SqlEditorHandle {
 }
 
 interface SqlEditorProps {
+  complete(request: SqlCompletionRequest): Promise<SqlCompletionResult>;
   document: SqlDocument;
-  metadata?: MetadataSnapshot;
+  editorFontSize: number;
   onChange(documentId: string, text: string): void;
   onCursorChange(position: CursorPosition): void;
+  onEditorFontSizeChange(fontSize: number): void;
   onExecute(): void;
   theme: 'light' | 'dark';
 }
 
-function aliasColumns(
+function toSuggestion(
+  item: SqlCompletionItem,
   model: monaco.editor.ITextModel,
-  position: monaco.Position,
-  metadata?: MetadataSnapshot,
-) {
-  const prefix = model.getValueInRange({
-    startLineNumber: 1,
-    startColumn: 1,
-    endLineNumber: position.lineNumber,
-    endColumn: position.column,
-  });
-  const alias = prefix.match(/([a-z_][a-z0-9_$#]*)\.([a-z0-9_$#]*)$/iu)?.[1];
-  if (!alias || !metadata) return undefined;
-  const escapedAlias = alias.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-  const declaration = new RegExp(
-    `(?:from|join)\\s+([a-z_][a-z0-9_$#.]*)\\s+(?:as\\s+)?${escapedAlias}\\b`,
-    'iu',
-  ).exec(prefix);
-  const objectName = declaration?.[1]?.split('.').at(-1);
-  return metadata.objects.find(
-    (object) => object.name.toLocaleLowerCase() === objectName?.toLocaleLowerCase(),
-  )?.columns;
+  windowBase: number,
+): monaco.languages.CompletionItem {
+  if (item.text === '…') {
+    const point = model.getPositionAt(windowBase + item.replaceEnd);
+    return {
+      label: { label: item.text, description: item.detail },
+      kind: monaco.languages.CompletionItemKind.Text,
+      insertText: '',
+      filterText: '…',
+      range: {
+        startLineNumber: point.lineNumber,
+        startColumn: point.column,
+        endLineNumber: point.lineNumber,
+        endColumn: point.column,
+      },
+    };
+  }
+  const start = model.getPositionAt(windowBase + item.replaceStart);
+  const end = model.getPositionAt(windowBase + item.replaceEnd);
+  return {
+    label: item.text,
+    kind: completionKinds[item.kind],
+    detail: item.detail,
+    insertText: item.text,
+    sortText: item.sortText,
+    range: {
+      startLineNumber: start.lineNumber,
+      startColumn: start.column,
+      endLineNumber: end.lineNumber,
+      endColumn: end.column,
+    },
+  };
 }
 
 export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function SqlEditor(
-  { document, metadata, onChange, onCursorChange, onExecute, theme },
+  { complete, document, editorFontSize, onChange, onCursorChange, onEditorFontSizeChange, onExecute, theme },
   forwardedRef,
 ) {
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const activeDocumentRef = useRef(document);
-  const metadataRef = useRef(metadata);
+  const completeRef = useRef(complete);
   const onChangeRef = useRef(onChange);
   const onCursorChangeRef = useRef(onCursorChange);
+  const onEditorFontSizeChangeRef = useRef(onEditorFontSizeChange);
   const onExecuteRef = useRef(onExecute);
   const initialThemeRef = useRef(theme);
+  const initialFontSizeRef = useRef(clampEditorFontSize(editorFontSize));
+  const reportedFontSizeRef = useRef(initialFontSizeRef.current);
+  const appliedFontSizeRef = useRef(initialFontSizeRef.current);
+  const requestSequence = useRef(0);
   const viewStates = useRef(new Map<string, monaco.editor.ICodeEditorViewState>());
   const applyingExternalText = useRef(false);
 
-  metadataRef.current = metadata;
+  completeRef.current = complete;
   onChangeRef.current = onChange;
   onCursorChangeRef.current = onCursorChange;
+  onEditorFontSizeChangeRef.current = onEditorFontSizeChange;
   onExecuteRef.current = onExecute;
 
   useImperativeHandle(forwardedRef, () => ({
@@ -127,49 +155,16 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
   useLayoutEffect(() => {
     if (!containerRef.current) return;
 
-    monaco.editor.defineTheme('sqlexplorer-light', {
-      base: 'vs',
-      inherit: true,
-      rules: [
-        { token: 'keyword.sql', foreground: '7B2CBF' },
-        { token: 'string.sql', foreground: 'A34A1F' },
-        { token: 'comment.sql', foreground: '77828D', fontStyle: 'italic' },
-      ],
-      colors: {
-        'editor.background': '#FFFFFF',
-        'editor.lineHighlightBackground': '#F5F7F9',
-        'editorLineNumber.foreground': '#7D8996',
-        'editorLineNumber.activeForeground': '#243140',
-        'editor.selectionBackground': '#CDECE7',
-        'editorCursor.foreground': '#008F83',
-      },
-    });
-    monaco.editor.defineTheme('sqlexplorer-dark', {
-      base: 'vs-dark',
-      inherit: true,
-      rules: [
-        { token: 'keyword.sql', foreground: 'C892FF' },
-        { token: 'string.sql', foreground: 'F5A97F' },
-        { token: 'comment.sql', foreground: '748393', fontStyle: 'italic' },
-      ],
-      colors: {
-        'editor.background': '#11161C',
-        'editor.lineHighlightBackground': '#192129',
-        'editorLineNumber.foreground': '#657483',
-        'editorLineNumber.activeForeground': '#DAE2EA',
-        'editor.selectionBackground': '#164E4B',
-        'editorCursor.foreground': '#48C9BB',
-      },
-    });
+    defineEditorThemes(monaco);
 
     const viewStateCache = viewStates.current;
     const editor = monaco.editor.create(containerRef.current, {
       model: modelForDocument(activeDocumentRef.current),
       automaticLayout: true,
-      fontFamily: "'Cascadia Code', 'JetBrains Mono', Consolas, monospace",
+      fontFamily: "'JetBrains Mono Variable', 'JetBrains Mono', Consolas, monospace",
       fontLigatures: true,
-      fontSize: 13,
-      lineHeight: 23,
+      fontSize: initialFontSizeRef.current,
+      lineHeight: editorLineHeight(initialFontSizeRef.current),
       lineNumbersMinChars: 3,
       minimap: { enabled: false },
       padding: { top: 10, bottom: 12 },
@@ -180,7 +175,7 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
       stickyScroll: { enabled: false },
       suggest: { preview: true, showStatusBar: true },
       tabSize: 2,
-      theme: initialThemeRef.current === 'dark' ? 'sqlexplorer-dark' : 'sqlexplorer-light',
+      theme: initialThemeRef.current === 'dark' ? DARK_EDITOR_THEME : LIGHT_EDITOR_THEME,
       wordWrap: 'off',
     });
     editorRef.current = editor;
@@ -206,6 +201,32 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
         column: event.position.column,
       });
     });
+    const configurationDisposable = editor.onDidChangeConfiguration((event) => {
+      if (!event.hasChanged(monaco.editor.EditorOption.fontSize)) return;
+      const size = clampEditorFontSize(editor.getOption(monaco.editor.EditorOption.fontSize));
+      if (size === reportedFontSizeRef.current) return;
+      appliedFontSizeRef.current = size;
+      reportedFontSizeRef.current = size;
+      editor.updateOptions({ fontSize: size, lineHeight: editorLineHeight(size) });
+      onEditorFontSizeChangeRef.current(size);
+    });
+    const applyFontSize = (size: number) => {
+      const clamped = clampEditorFontSize(size);
+      if (clamped === appliedFontSizeRef.current) return;
+      appliedFontSizeRef.current = clamped;
+      reportedFontSizeRef.current = clamped;
+      editor.updateOptions({ fontSize: clamped, lineHeight: editorLineHeight(clamped) });
+      onEditorFontSizeChangeRef.current(clamped);
+    };
+    const wheelListener = (event: WheelEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const direction = event.deltaY > 0 ? -1 : 1;
+      applyFontSize(editor.getOption(monaco.editor.EditorOption.fontSize) + direction);
+    };
+    const wheelTarget = containerRef.current;
+    wheelTarget.addEventListener('wheel', wheelListener, { capture: true, passive: false });
     editor.addCommand(monaco.KeyCode.F8, () => onExecuteRef.current());
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => onExecuteRef.current());
     editor.addCommand(monaco.KeyCode.F6, () => {
@@ -215,63 +236,39 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
     const completionDisposable = monaco.languages.registerCompletionItemProvider('sql', {
       triggerCharacters: ['.', ' '],
       provideCompletionItems(model, position) {
-        const word = model.getWordUntilPosition(position);
-        const range = {
-          startLineNumber: position.lineNumber,
-          endLineNumber: position.lineNumber,
-          startColumn: word.startColumn,
-          endColumn: word.endColumn,
-        };
-        const scopedColumns = aliasColumns(model, position, metadataRef.current);
-        const metadataItems = scopedColumns
-          ? scopedColumns.map((column) => ({
-              label: column.name,
-              kind: monaco.languages.CompletionItemKind.Field,
-              detail: column.dataType,
-              insertText: column.name,
-              range,
-              sortText: `0-${column.position.toString().padStart(4, '0')}`,
-            }))
-          : (metadataRef.current?.objects.flatMap((object) => [
-              {
-                label: object.name,
-                kind:
-                  object.kind === 'table' || object.kind === 'view'
-                    ? monaco.languages.CompletionItemKind.Struct
-                    : monaco.languages.CompletionItemKind.Module,
-                detail: `${object.kind} · ${object.schema}`,
-                insertText: object.name,
-                range,
-                sortText: `1-${object.name}`,
-              },
-              ...(object.columns ?? []).map((column) => ({
-                label: column.name,
-                kind: monaco.languages.CompletionItemKind.Field,
-                detail: `${column.dataType} · ${object.name}`,
-                insertText: column.name,
-                range,
-                sortText: `2-${column.name}`,
-              })),
-            ]) ?? []);
-        return {
-          suggestions: [
-            ...metadataItems,
-            ...sqlKeywords.map((keyword) => ({
-              label: keyword.toUpperCase(),
-              kind: monaco.languages.CompletionItemKind.Keyword,
-              insertText: keyword,
-              range,
-              sortText: `9-${keyword}`,
-            })),
-          ],
-        };
+        const active = activeDocumentRef.current;
+        const offset = model.getOffsetAt(position);
+        const fullText = model.getValue();
+        const [statementStart, statementEnd] = statementRangeAtOffset(fullText, offset);
+        let windowText = fullText.slice(statementStart, statementEnd);
+        let cursorOffset = offset - statementStart;
+        let windowBase = statementStart;
+        if (windowText.length > MAX_WINDOW_CHARS) {
+          const cut = Math.max(0, cursorOffset - CONTEXT_BEFORE_CURSOR);
+          windowText = windowText.slice(cut, Math.min(windowText.length, cursorOffset + 4_000));
+          cursorOffset -= cut;
+          windowBase += cut;
+        }
+        const sequence = ++requestSequence.current;
+        return completeRef.current({
+          connectionId: active.connectionId,
+          documentId: active.id,
+          dialect: active.dialect,
+          textWindow: windowText,
+          cursorOffset,
+        }).then((result) => {
+          if (sequence !== requestSequence.current) return { suggestions: [] };
+          return { suggestions: result.items.map((item) => toSuggestion(item, model, windowBase)) };
+        }).catch(() => ({ suggestions: [] }));
       },
     });
 
     return () => {
       const finalViewState = editor.saveViewState();
       if (finalViewState) viewStateCache.set(activeDocumentRef.current.id, finalViewState);
+      wheelTarget.removeEventListener('wheel', wheelListener, { capture: true });
       completionDisposable.dispose();
+      configurationDisposable.dispose();
       cursorDisposable.dispose();
       changeDisposable.dispose();
       editor.dispose();
@@ -315,7 +312,17 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
   }, [document.id, document.text]);
 
   useEffect(() => {
-    monaco.editor.setTheme(theme === 'dark' ? 'sqlexplorer-dark' : 'sqlexplorer-light');
+    const editor = editorRef.current;
+    if (!editor) return;
+    const size = clampEditorFontSize(editorFontSize);
+    reportedFontSizeRef.current = size;
+    if (size === appliedFontSizeRef.current) return;
+    appliedFontSizeRef.current = size;
+    editor.updateOptions({ fontSize: size, lineHeight: editorLineHeight(size) });
+  }, [editorFontSize]);
+
+  useEffect(() => {
+    monaco.editor.setTheme(theme === 'dark' ? DARK_EDITOR_THEME : LIGHT_EDITOR_THEME);
   }, [theme]);
 
   return <div className="sql-editor" ref={containerRef} data-testid="sql-editor" />;

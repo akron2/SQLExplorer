@@ -1,18 +1,20 @@
 import { DatabaseSync } from 'node:sqlite';
 import type {
   AppMetric,
-  MetadataSnapshot,
   OracleClientDefinition,
   OracleSettings,
   PublicConnectionProfile,
   RecentSqlFile,
   SqlDocument,
+  UiSettings,
   WorkspaceSnapshot,
 } from '../shared/contracts';
-import { createDefaultWorkspace } from '../shared/defaults';
+import { createDefaultWorkspace, normalizeUiSettings } from '../shared/defaults';
+import { CatalogStore } from './catalog-store';
 
 const WORKSPACE_KEY = 'workspace';
 const ORACLE_SETTINGS_KEY = 'oracle-settings';
+const UI_SETTINGS_KEY = 'ui-settings';
 
 function normalizeDocument(value: Partial<SqlDocument>, index: number): SqlDocument {
   const timestamp = new Date().toISOString();
@@ -29,6 +31,7 @@ function normalizeDocument(value: Partial<SqlDocument>, index: number): SqlDocum
     bom: value.bom ?? 'none',
     eol: value.eol ?? 'lf',
     filePath: typeof value.filePath === 'string' ? value.filePath : undefined,
+    schema: typeof value.schema === 'string' && value.schema ? value.schema : undefined,
     diskVersion: value.diskVersion,
     viewState: value.viewState,
   };
@@ -47,7 +50,7 @@ function migrateWorkspace(value: unknown): WorkspaceSnapshot {
     ? snapshot.activeDocumentId as string
     : documents[0].id;
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     activeDocumentId,
     documents,
     closedDocuments,
@@ -63,9 +66,12 @@ function migrateWorkspace(value: unknown): WorkspaceSnapshot {
 }
 
 export class WorkspaceStore {
+  readonly catalog: CatalogStore;
   readonly #database: DatabaseSync;
+  readonly #databasePath: string;
 
   constructor(databasePath: string) {
+    this.#databasePath = databasePath;
     this.#database = new DatabaseSync(databasePath);
     this.#database.exec(`
       PRAGMA journal_mode = WAL;
@@ -107,12 +113,8 @@ export class WorkspaceStore {
         title TEXT NOT NULL,
         opened_at TEXT NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS metadata_cache (
-        connection_id TEXT PRIMARY KEY,
-        snapshot_json TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
     `);
+    this.catalog = new CatalogStore(this.#database);
   }
 
   loadWorkspace(): WorkspaceSnapshot {
@@ -122,7 +124,8 @@ export class WorkspaceStore {
     if (!row?.value) return createDefaultWorkspace();
     try {
       return migrateWorkspace(JSON.parse(row.value));
-    } catch {
+    } catch (error) {
+      console.error(`Рабочее пространство не читается, используется пустое: ${this.#databasePath}`, error);
       return createDefaultWorkspace();
     }
   }
@@ -228,6 +231,23 @@ export class WorkspaceStore {
     this.#saveAppState(ORACLE_SETTINGS_KEY, settings);
   }
 
+  loadUiSettings(): UiSettings {
+    const row = this.#database.prepare('SELECT value FROM app_state WHERE key = ?')
+      .get(UI_SETTINGS_KEY) as { value?: string } | undefined;
+    if (!row?.value) return normalizeUiSettings(undefined);
+    try {
+      return normalizeUiSettings(JSON.parse(row.value));
+    } catch {
+      return normalizeUiSettings(undefined);
+    }
+  }
+
+  saveUiSettings(settings: UiSettings): UiSettings {
+    const normalized = normalizeUiSettings(settings);
+    this.#saveAppState(UI_SETTINGS_KEY, normalized);
+    return normalized;
+  }
+
   saveRecentFile(filePath: string, title: string): void {
     const now = new Date().toISOString();
     this.#database.prepare(`
@@ -249,32 +269,6 @@ export class WorkspaceStore {
       const value = row as { file_path: string; opened_at: string; title: string };
       return { filePath: value.file_path, title: value.title, openedAt: value.opened_at };
     });
-  }
-
-  saveMetadata(snapshot: MetadataSnapshot): void {
-    this.#database.prepare(`
-      INSERT INTO metadata_cache (connection_id, snapshot_json, updated_at)
-      VALUES (?, ?, ?)
-      ON CONFLICT(connection_id) DO UPDATE SET
-        snapshot_json = excluded.snapshot_json,
-        updated_at = excluded.updated_at
-    `).run(snapshot.connectionId, JSON.stringify(snapshot), new Date().toISOString());
-  }
-
-  listMetadata(): MetadataSnapshot[] {
-    const rows = this.#database.prepare('SELECT snapshot_json FROM metadata_cache')
-      .all() as Array<{ snapshot_json: string }>;
-    return rows.flatMap((row) => {
-      try {
-        return [{ ...JSON.parse(row.snapshot_json) as MetadataSnapshot, stale: true }];
-      } catch {
-        return [];
-      }
-    });
-  }
-
-  deleteMetadata(connectionId: string): void {
-    this.#database.prepare('DELETE FROM metadata_cache WHERE connection_id = ?').run(connectionId);
   }
 
   recordMetric(metric: AppMetric): void {

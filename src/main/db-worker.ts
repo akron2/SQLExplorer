@@ -2,6 +2,11 @@ import oracledb from 'oracledb';
 import pg from 'pg';
 import Cursor from 'pg-cursor';
 import type {
+  CatalogColumn,
+  CatalogObjectKind,
+  CatalogObjectPage,
+  CatalogObjectQuery,
+  CatalogOverview,
   CellValue,
   ConnectionProfile,
   ConnectionTestResult,
@@ -9,14 +14,13 @@ import type {
   DatabaseRuntimeConfiguration,
   ExecuteRequest,
   FetchMoreRequest,
-  MetadataColumn,
-  MetadataObject,
-  MetadataSnapshot,
   QueryColumn,
   QueryPage,
   QueryRow,
+  SessionContextResult,
   SessionRequest,
   SessionState,
+  SetSessionSchemaRequest,
   TransactionRequest,
   WorkerEvent,
   WorkerRequest,
@@ -370,7 +374,11 @@ async function closeSession(session: DatabaseSession, force: boolean): Promise<S
   return state;
 }
 
-async function createSession(profile: ConnectionProfile, documentId: string): Promise<DatabaseSession> {
+async function createSession(
+  profile: ConnectionProfile,
+  documentId: string,
+  schema?: string,
+): Promise<DatabaseSession> {
   if (initializationError) throw Object.assign(new Error(initializationError.message), { databaseError: initializationError });
   if (profile.kind !== runtime.kind) throw new Error(`Profile ${profile.kind} was routed to ${runtime.kind}`);
   if (profile.kind === 'oracle' && profile.driverMode !== runtime.mode) {
@@ -401,6 +409,7 @@ async function createSession(profile: ConnectionProfile, documentId: string): Pr
         changed: false, connectedAt: now, lastActivityAt: now,
       };
       sessions.set(key, created);
+      if (schema) await applySessionSchema(created, schema);
       emitState(stateFor(created, 'connected'));
       return created;
     }
@@ -426,6 +435,7 @@ async function createSession(profile: ConnectionProfile, documentId: string): Pr
     client.on('end', () => {
       if (sessions.get(key) === created) void invalidateSession(created, new Error('PostgreSQL connection ended'));
     });
+    if (schema) await applySessionSchema(created, schema);
     emitState(stateFor(created, 'connected'));
     return created;
   } catch (error) {
@@ -436,7 +446,7 @@ async function createSession(profile: ConnectionProfile, documentId: string): Pr
 }
 
 async function connect(payload: { profile: ConnectionProfile; request: SessionRequest }): Promise<SessionState> {
-  const session = await createSession(payload.profile, payload.request.documentId);
+  const session = await createSession(payload.profile, payload.request.documentId, payload.request.schema);
   return stateFor(session, 'connected');
 }
 
@@ -565,7 +575,7 @@ async function executePostgres(session: PostgresSession, request: ExecuteRequest
 
 async function execute(payload: { profile: ConnectionProfile; request: ExecuteRequest }): Promise<QueryPage> {
   const { profile, request } = payload;
-  const session = await createSession(profile, request.documentId);
+  const session = await createSession(profile, request.documentId, request.schema);
   if (session.activeExecutionId) throw new Error('Another command is already running in this document');
   try {
     await closeSessionCursors(session.sessionKey);
@@ -721,108 +731,437 @@ function oracleType(column: Record<string, unknown>): string {
   return dataType;
 }
 
-async function oracleMetadata(profile: ConnectionProfile): Promise<MetadataSnapshot> {
+const ORACLE_KIND_MAP: Record<string, CatalogObjectKind> = {
+  TABLE: 'table',
+  VIEW: 'view',
+  'MATERIALIZED VIEW': 'matview',
+  PACKAGE: 'package',
+  SEQUENCE: 'sequence',
+  SYNONYM: 'synonym',
+  FUNCTION: 'function',
+  PROCEDURE: 'procedure',
+  TYPE: 'type',
+};
+const ORACLE_TYPES = Object.keys(ORACLE_KIND_MAP);
+const ORACLE_KIND_TO_TYPES: Record<CatalogObjectKind, string[]> = {
+  table: ['TABLE'],
+  view: ['VIEW'],
+  matview: ['MATERIALIZED VIEW'],
+  package: ['PACKAGE'],
+  sequence: ['SEQUENCE'],
+  synonym: ['SYNONYM'],
+  function: ['FUNCTION'],
+  procedure: ['PROCEDURE'],
+  type: ['TYPE'],
+};
+
+function oracleTypeList(kinds?: CatalogObjectKind[]): string {
+  const types = kinds?.length ? kinds.flatMap((kind) => ORACLE_KIND_TO_TYPES[kind]) : ORACLE_TYPES;
+  return types.length ? types.map((type) => `'${type}'`).join(', ') : `''`;
+}
+
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/gu, (character) => `\\${character}`);
+}
+
+function stringValue(value: unknown, fallback: string): string {
+  return typeof value === 'string' || typeof value === 'number' ? String(value) : fallback;
+}
+
+function parsePostgresSearchPath(value: string): string[] {
+  return value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => entry.startsWith('"') && entry.endsWith('"')
+      ? entry.slice(1, -1).replaceAll('""', '"')
+      : entry);
+}
+
+async function applySessionSchema(session: DatabaseSession, schema: string): Promise<void> {
+  if (!schema) return;
+  if (session.kind === 'oracle') {
+    const quoted = `"${schema.replaceAll('"', '""')}"`;
+    await session.connection.execute(`ALTER SESSION SET CURRENT_SCHEMA = ${quoted}`);
+  } else {
+    await session.client.query('select pg_catalog.set_config($1, $2, false)', ['search_path', schema]);
+  }
+}
+
+async function oracleOverview(profile: ConnectionProfile): Promise<CatalogOverview> {
   const connection = await oracledb.getConnection(oracleConnectionAttributes(profile));
   try {
-    const [objectResult, columnResult] = await Promise.all([
+    const [userResult, contextResult] = await Promise.all([
       connection.execute<Record<string, unknown>>(
-        `select object_name, object_type from user_objects
-         where object_type in ('TABLE', 'VIEW', 'PACKAGE', 'SEQUENCE', 'SYNONYM', 'FUNCTION')
-         order by object_type, object_name`,
-        {}, { outFormat: oracledb.OUT_FORMAT_OBJECT },
+        'select username from all_users order by username', {}, { outFormat: oracledb.OUT_FORMAT_OBJECT },
       ),
       connection.execute<Record<string, unknown>>(
-        `select table_name, column_name, data_type, data_length, data_precision,
-                data_scale, nullable, column_id from user_tab_columns
-         order by table_name, column_id`,
+        `select sys_context('USERENV', 'CURRENT_USER') as current_user,
+                sys_context('USERENV', 'CURRENT_SCHEMA') as current_schema
+         from dual`,
         {}, { outFormat: oracledb.OUT_FORMAT_OBJECT },
       ),
     ]);
-    const columnsByObject = new Map<string, MetadataColumn[]>();
-    for (const column of columnResult.rows ?? []) {
-      const name = String(column.TABLE_NAME);
-      const columns = columnsByObject.get(name) ?? [];
-      columns.push({
-        name: String(column.COLUMN_NAME), dataType: oracleType(column),
-        nullable: column.NULLABLE === 'Y', position: Number(column.COLUMN_ID),
-      });
-      columnsByObject.set(name, columns);
-    }
-    const kindMap: Record<string, MetadataObject['kind']> = {
-      TABLE: 'table', VIEW: 'view', PACKAGE: 'package', SEQUENCE: 'sequence',
-      SYNONYM: 'synonym', FUNCTION: 'function',
-    };
-    const schema = profile.username.toUpperCase();
+    const context = contextResult.rows?.[0];
     return {
-      connectionId: profile.id, schema, fetchedAt: new Date().toISOString(),
-      objects: (objectResult.rows ?? []).map((object) => {
-        const name = String(object.OBJECT_NAME);
-        return {
-          schema, name, kind: kindMap[String(object.OBJECT_TYPE)] ?? 'table',
-          columns: columnsByObject.get(name),
-        };
-      }),
+      userName: stringValue(context?.CURRENT_USER, profile.username.toUpperCase()),
+      currentSchema: stringValue(context?.CURRENT_SCHEMA, profile.username.toUpperCase()),
+      searchPath: [],
+      schemas: (userResult.rows ?? []).map((row) => String(row.USERNAME)),
     };
   } finally {
     await connection.close();
   }
 }
 
-async function postgresMetadata(profile: ConnectionProfile): Promise<MetadataSnapshot> {
+async function oracleCountSchemaObjects(profile: ConnectionProfile, schema: string): Promise<number> {
+  const connection = await oracledb.getConnection(oracleConnectionAttributes(profile));
+  try {
+    const result = await connection.execute<Record<string, unknown>>(
+      `select count(*) as object_count from all_objects
+       where owner = :owner and object_type in (${oracleTypeList()})`,
+      { owner: schema },
+      { outFormat: oracledb.OUT_FORMAT_OBJECT },
+    );
+    return Number(result.rows?.[0]?.OBJECT_COUNT ?? 0);
+  } finally {
+    await connection.close();
+  }
+}
+
+function oracleObjectPage(
+  rows: Record<string, unknown>[],
+  limit: number,
+  schema: string,
+): CatalogObjectPage {
+  const hasMore = rows.length > limit;
+  return {
+    hasMore,
+    objects: rows.slice(0, limit).map((row) => ({
+      schema,
+      name: String(row.OBJECT_NAME),
+      kind: ORACLE_KIND_MAP[String(row.OBJECT_TYPE)] ?? 'table',
+    })),
+  };
+}
+
+async function oracleListObjects(
+  profile: ConnectionProfile,
+  query: CatalogObjectQuery,
+): Promise<CatalogObjectPage> {
+  const connection = await oracledb.getConnection(oracleConnectionAttributes(profile));
+  try {
+    const limit = Math.max(1, Math.min(5_000, Math.trunc(query.limit)));
+    const offset = Math.max(0, Math.trunc(query.offset ?? 0));
+    const rawPrefix = query.prefix ?? '';
+    const prefix = query.caseSensitive ? rawPrefix : rawPrefix.toUpperCase();
+    const escaped = escapeLikePattern(prefix);
+    const pattern = !prefix ? '%' : query.substring ? `%${escaped}%` : `${escaped}%`;
+    if (query.schema.toUpperCase() === 'PUBLIC') {
+      if (query.kinds?.length && !query.kinds.includes('synonym')) return { hasMore: false, objects: [] };
+      const result = await connection.execute<Record<string, unknown>>(
+        `select synonym_name as object_name, 'SYNONYM' as object_type
+         from all_synonyms
+         where owner = 'PUBLIC' and synonym_name like :pattern escape '\\'
+         order by synonym_name
+         offset :offset rows fetch next :limit rows only`,
+        { pattern, offset, limit: limit + 1 },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
+      );
+      return oracleObjectPage(result.rows ?? [], limit, query.schema);
+    }
+    const result = await connection.execute<Record<string, unknown>>(
+      `select object_name, object_type from all_objects
+       where owner = :owner and object_type in (${oracleTypeList(query.kinds)})
+         and object_name like :pattern escape '\\'
+       order by object_name
+       offset :offset rows fetch next :limit rows only`,
+      { owner: query.schema, pattern, offset, limit: limit + 1 },
+      { outFormat: oracledb.OUT_FORMAT_OBJECT },
+    );
+    return oracleObjectPage(result.rows ?? [], limit, query.schema);
+  } finally {
+    await connection.close();
+  }
+}
+
+async function oracleListColumns(
+  profile: ConnectionProfile,
+  schema: string,
+  object: string,
+): Promise<CatalogColumn[]> {
+  const connection = await oracledb.getConnection(oracleConnectionAttributes(profile));
+  try {
+    const read = async (owner: string, table: string): Promise<Record<string, unknown>[]> => (
+      await connection.execute<Record<string, unknown>>(
+        `select column_name, data_type, data_length, data_precision, data_scale, nullable, column_id
+         from all_tab_columns where owner = :owner and table_name = :object order by column_id`,
+        { owner, object: table },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
+      )
+    ).rows ?? [];
+    let rows = await read(schema, object);
+    if (!rows.length) {
+      const synonyms = (await connection.execute<Record<string, unknown>>(
+        `select table_owner, table_name, db_link from all_synonyms
+         where synonym_name = :object and owner in (:owner, 'PUBLIC')
+         order by case when owner = :owner then 0 else 1 end`,
+        { owner: schema, object },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
+      )).rows ?? [];
+      const target = synonyms.find((row) => row.TABLE_OWNER && !row.DB_LINK);
+      if (target) rows = await read(String(target.TABLE_OWNER), String(target.TABLE_NAME));
+    }
+    return rows.map((column) => ({
+      name: String(column.COLUMN_NAME),
+      dataType: oracleType(column),
+      nullable: column.NULLABLE === 'Y',
+      position: Number(column.COLUMN_ID),
+    }));
+  } finally {
+    await connection.close();
+  }
+}
+
+async function postgresOverview(profile: ConnectionProfile): Promise<CatalogOverview> {
   const client = new Client({
     host: profile.host, port: profile.port, database: profile.database,
     user: profile.username, password: profile.password,
-    application_name: 'SQLExplorer metadata',
+    application_name: 'SQLExplorer catalog overview',
     connectionTimeoutMillis: 10_000,
   });
   await client.connect();
   try {
-    const result = await client.query<{
-      column_name: string | null;
-      data_type: string | null;
-      is_nullable: 'YES' | 'NO' | null;
-      object_name: string;
-      object_type: 'BASE TABLE' | 'VIEW';
-      ordinal_position: number | null;
-      table_schema: string;
-    }>(`
-      select t.table_schema, t.table_name as object_name, t.table_type as object_type,
-             c.column_name, c.data_type, c.is_nullable, c.ordinal_position
-      from information_schema.tables t
-      left join information_schema.columns c
-        on c.table_schema = t.table_schema and c.table_name = t.table_name
-      where t.table_schema not in ('pg_catalog', 'information_schema')
-      order by t.table_schema, t.table_name, c.ordinal_position
-    `);
-    const objects = new Map<string, MetadataObject>();
-    for (const row of result.rows) {
-      const key = `${row.table_schema}.${row.object_name}`;
-      let object = objects.get(key);
-      if (!object) {
-        object = {
-          schema: row.table_schema, name: row.object_name,
-          kind: row.object_type === 'VIEW' ? 'view' : 'table', columns: [],
-        };
-        objects.set(key, object);
-      }
-      if (row.column_name && row.data_type && row.ordinal_position) {
-        object.columns?.push({
-          name: row.column_name, dataType: row.data_type,
-          nullable: row.is_nullable === 'YES', position: row.ordinal_position,
-        });
-      }
-    }
+    const [schemaResult, contextResult] = await Promise.all([
+      client.query<{ nspname: string }>(
+        `select nspname from pg_catalog.pg_namespace
+         where nspname not in ('pg_catalog', 'information_schema', 'pg_toast')
+           and has_schema_privilege(oid, 'USAGE')
+         order by nspname`,
+      ),
+      client.query<{ current_schema: string | null; current_user: string; search_path: string }>(
+        `select current_user, current_schema() as current_schema, current_setting('search_path') as search_path`,
+      ),
+    ]);
+    const context = contextResult.rows[0];
     return {
-      connectionId: profile.id, schema: 'public', fetchedAt: new Date().toISOString(),
-      objects: [...objects.values()],
+      userName: context?.current_user ?? profile.username,
+      currentSchema: context?.current_schema ?? 'public',
+      searchPath: parsePostgresSearchPath(context?.search_path ?? ''),
+      schemas: schemaResult.rows.map((row) => row.nspname),
     };
   } finally {
     await client.end();
   }
 }
 
-async function refreshMetadata(profile: ConnectionProfile): Promise<MetadataSnapshot> {
-  return profile.kind === 'oracle' ? oracleMetadata(profile) : postgresMetadata(profile);
+async function postgresCountSchemaObjects(profile: ConnectionProfile, schema: string): Promise<number> {
+  const client = new Client({
+    host: profile.host, port: profile.port, database: profile.database,
+    user: profile.username, password: profile.password,
+    application_name: 'SQLExplorer catalog count',
+    connectionTimeoutMillis: 10_000,
+  });
+  await client.connect();
+  try {
+    const result = await client.query<{ object_count: string }>(
+      `select
+        (select count(*) from pg_catalog.pg_class c
+          join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = $1 and c.relkind in ('r', 'p', 'v', 'm', 'S', 'f')
+           and (case when c.relkind = 'S'
+                     then has_sequence_privilege(c.oid, 'USAGE,SELECT,UPDATE')
+                     else has_table_privilege(c.oid, 'SELECT,INSERT,UPDATE,DELETE,REFERENCES,TRIGGER') end))
+        + (select count(*) from pg_catalog.pg_proc p
+            join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+           where n.nspname = $1 and has_function_privilege(p.oid, 'EXECUTE')) as object_count`,
+      [schema],
+    );
+    return Number(result.rows[0]?.object_count ?? 0);
+  } finally {
+    await client.end();
+  }
+}
+
+async function postgresListObjects(
+  profile: ConnectionProfile,
+  query: CatalogObjectQuery,
+): Promise<CatalogObjectPage> {
+  const client = new Client({
+    host: profile.host, port: profile.port, database: profile.database,
+    user: profile.username, password: profile.password,
+    application_name: 'SQLExplorer catalog',
+    connectionTimeoutMillis: 10_000,
+  });
+  await client.connect();
+  try {
+    const limit = Math.max(1, Math.min(5_000, Math.trunc(query.limit)));
+    const offset = Math.max(0, Math.trunc(query.offset ?? 0));
+    const rawPrefix = query.prefix ?? '';
+    const prefix = query.caseSensitive ? rawPrefix : rawPrefix.toLocaleLowerCase();
+    const escaped = escapeLikePattern(prefix);
+    const pattern = !prefix ? '%' : query.substring ? `%${escaped}%` : `${escaped}%`;
+    const kinds = query.kinds?.length ? new Set(query.kinds) : undefined;
+    const relationKinds = kinds
+      ? [...kinds].flatMap((kind) => kind === 'table' ? ['r', 'p', 'f']
+        : kind === 'view' ? ['v'] : kind === 'matview' ? ['m'] : kind === 'sequence' ? ['S'] : [])
+      : ['r', 'p', 'v', 'm', 'S', 'f'];
+    const branches: string[] = [];
+    if (relationKinds.length) {
+      branches.push(`
+        select c.relname as name,
+               case c.relkind when 'r' then 'table' when 'p' then 'table' when 'v' then 'view'
+                    when 'm' then 'matview' when 'S' then 'sequence' when 'f' then 'table' end as kind
+        from pg_catalog.pg_class c
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = $1 and c.relkind in (${relationKinds.map((kind) => `'${kind}'`).join(', ')})
+          and c.relname like $2 escape '\\'
+          and (case when c.relkind = 'S'
+                    then has_sequence_privilege(c.oid, 'USAGE,SELECT,UPDATE')
+                    else has_table_privilege(c.oid, 'SELECT,INSERT,UPDATE,DELETE,REFERENCES,TRIGGER') end)
+      `);
+    }
+    if (!kinds || kinds.has('function') || kinds.has('procedure')) {
+      branches.push(`
+        select p.proname as name, 'function' as kind
+        from pg_catalog.pg_proc p
+        join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = $1 and p.proname like $2 escape '\\'
+          and has_function_privilege(p.oid, 'EXECUTE')
+      `);
+    }
+    if (!branches.length) return { hasMore: false, objects: [] };
+    const result = await client.query<{ kind: string; name: string }>(
+      `select name, kind from (${branches.join(' union all ')}) objects
+       order by name, kind
+       limit $3 offset $4`,
+      [query.schema, pattern, limit + 1, offset],
+    );
+    const hasMore = result.rows.length > limit;
+    return {
+      hasMore,
+      objects: result.rows.slice(0, limit).map((row) => ({
+        schema: query.schema,
+        name: row.name,
+        kind: row.kind as CatalogObjectKind,
+      })),
+    };
+  } finally {
+    await client.end();
+  }
+}
+
+async function postgresListColumns(
+  profile: ConnectionProfile,
+  schema: string,
+  object: string,
+): Promise<CatalogColumn[]> {
+  const client = new Client({
+    host: profile.host, port: profile.port, database: profile.database,
+    user: profile.username, password: profile.password,
+    application_name: 'SQLExplorer catalog columns',
+    connectionTimeoutMillis: 10_000,
+  });
+  await client.connect();
+  try {
+    const result = await client.query<{
+      data_type: string;
+      name: string;
+      nullable: boolean;
+      position: number;
+    }>(
+      `select a.attname as name,
+              pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type,
+              not a.attnotnull as nullable,
+              a.attnum as position
+       from pg_catalog.pg_attribute a
+       join pg_catalog.pg_class c on c.oid = a.attrelid
+       join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+       where n.nspname = $1 and c.relname = $2 and a.attnum > 0 and not a.attisdropped
+       order by a.attnum`,
+      [schema, object],
+    );
+    return result.rows.map((row) => ({
+      name: row.name,
+      dataType: row.data_type,
+      nullable: row.nullable,
+      position: Number(row.position),
+    }));
+  } finally {
+    await client.end();
+  }
+}
+
+async function catalogOverview(profile: ConnectionProfile): Promise<CatalogOverview> {
+  return profile.kind === 'oracle' ? oracleOverview(profile) : postgresOverview(profile);
+}
+
+async function countSchemaObjects(profile: ConnectionProfile, schema: string): Promise<number> {
+  return profile.kind === 'oracle'
+    ? oracleCountSchemaObjects(profile, schema)
+    : postgresCountSchemaObjects(profile, schema);
+}
+
+async function listObjects(
+  profile: ConnectionProfile,
+  query: CatalogObjectQuery,
+): Promise<CatalogObjectPage> {
+  return profile.kind === 'oracle'
+    ? oracleListObjects(profile, query)
+    : postgresListObjects(profile, query);
+}
+
+async function listColumns(
+  profile: ConnectionProfile,
+  schema: string,
+  object: string,
+): Promise<CatalogColumn[]> {
+  return profile.kind === 'oracle'
+    ? oracleListColumns(profile, schema, object)
+    : postgresListColumns(profile, schema, object);
+}
+
+async function sessionContext(
+  profile: ConnectionProfile,
+  request: Pick<SessionRequest, 'connectionId' | 'documentId'>,
+): Promise<SessionContextResult | undefined> {
+  const session = sessions.get(sessionKey(profile.id, request.documentId));
+  if (!session) return undefined;
+  if (session.kind === 'oracle') {
+    const result = await session.connection.execute<Record<string, unknown>>(
+      `select sys_context('USERENV', 'CURRENT_USER') as current_user,
+              sys_context('USERENV', 'CURRENT_SCHEMA') as current_schema
+       from dual`,
+      {}, { outFormat: oracledb.OUT_FORMAT_OBJECT },
+    );
+    const row = result.rows?.[0];
+    return {
+      userName: stringValue(row?.CURRENT_USER, session.profile.username.toUpperCase()),
+      currentSchema: stringValue(row?.CURRENT_SCHEMA, session.profile.username.toUpperCase()),
+      searchPath: [],
+    };
+  }
+  const result = await session.client.query<{
+    current_schema: string | null;
+    current_user: string;
+    search_path: string;
+  }>(`select current_user, current_schema() as current_schema, current_setting('search_path') as search_path`);
+  const row = result.rows[0];
+  return {
+    userName: row?.current_user ?? session.profile.username,
+    currentSchema: row?.current_schema ?? 'public',
+    searchPath: parsePostgresSearchPath(row?.search_path ?? ''),
+  };
+}
+
+async function setSessionSchema(
+  profile: ConnectionProfile,
+  request: SetSessionSchemaRequest,
+): Promise<SessionContextResult | undefined> {
+  const session = sessions.get(sessionKey(profile.id, request.documentId));
+  if (!session) return undefined;
+  await applySessionSchema(session, request.schema);
+  return sessionContext(profile, request);
 }
 
 async function closeAll(): Promise<void> {
@@ -842,7 +1181,27 @@ async function dispatch(request: WorkerRequest): Promise<unknown> {
     case 'commit': return transaction('commit', request.payload as { profile: ConnectionProfile; request: TransactionRequest });
     case 'rollback': return transaction('rollback', request.payload as { profile: ConnectionProfile; request: TransactionRequest });
     case 'testConnection': return testConnection((request.payload as { profile: ConnectionProfile }).profile);
-    case 'refreshMetadata': return refreshMetadata((request.payload as { profile: ConnectionProfile }).profile);
+    case 'catalogOverview': return catalogOverview((request.payload as { profile: ConnectionProfile }).profile);
+    case 'countSchemaObjects': return countSchemaObjects(
+      (request.payload as { profile: ConnectionProfile }).profile,
+      (request.payload as { schema: string }).schema,
+    );
+    case 'listObjects': {
+      const payload = request.payload as { profile: ConnectionProfile; query: CatalogObjectQuery };
+      return listObjects(payload.profile, payload.query);
+    }
+    case 'listColumns': {
+      const payload = request.payload as { object: string; profile: ConnectionProfile; schema: string };
+      return listColumns(payload.profile, payload.schema, payload.object);
+    }
+    case 'sessionContext': {
+      const payload = request.payload as { profile: ConnectionProfile; request: SessionRequest };
+      return sessionContext(payload.profile, payload.request);
+    }
+    case 'setSessionSchema': {
+      const payload = request.payload as { profile: ConnectionProfile; request: SetSessionSchemaRequest };
+      return setSessionSchema(payload.profile, payload.request);
+    }
     case 'listTnsAliases': return oracledb.getNetworkServiceNames((request.payload as { configDir: string }).configDir);
     case 'close': return closeAll();
     default: throw new Error(`Unsupported database worker method: ${String(request.method)}`);

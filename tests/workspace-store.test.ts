@@ -71,24 +71,36 @@ describe('WorkspaceStore', () => {
 
     const migratedStore = new WorkspaceStore(file);
     const migrated = migratedStore.loadWorkspace();
-    expect(migrated.schemaVersion).toBe(2);
+    expect(migrated.schemaVersion).toBe(3);
     expect(migrated.documents[0]).toMatchObject({
       id: 'legacy', text: 'select * from legacy_table;', encoding: 'utf8', bom: 'none', eol: 'lf',
     });
     migratedStore.close();
   });
 
-  it('persists recent files and marks cached metadata as stale', () => {
+  it('persists recent files and stores catalog entries', () => {
     const file = path.join(tmpdir(), `sqlexplorer-test-${crypto.randomUUID()}.sqlite`);
     createdFiles.push(file);
     const store = new WorkspaceStore(file);
     store.saveRecentFile('C:\\sql\\one.sql', 'one.sql');
-    store.saveMetadata({
-      connectionId: 'profile-1', schema: 'PUBLIC', fetchedAt: new Date().toISOString(),
-      objects: [{ kind: 'table', name: 'employees', schema: 'PUBLIC' }],
-    });
+    store.catalog.syncSchemas('profile-1', ['PUBLIC'], 'PUBLIC');
+    store.catalog.storeObjects('profile-1', 'PUBLIC', [
+      { kind: 'table', name: 'employees', schema: 'PUBLIC' },
+      { kind: 'view', name: 'employee_details', schema: 'PUBLIC' },
+    ]);
+    store.catalog.storeColumns('profile-1', 'PUBLIC', 'employees', [
+      { name: 'ID', dataType: 'NUMBER(10)', nullable: false, position: 1 },
+    ]);
     expect(store.listRecentFiles()[0]).toMatchObject({ filePath: 'C:\\sql\\one.sql', title: 'one.sql' });
-    expect(store.listMetadata()[0]).toMatchObject({ connectionId: 'profile-1', stale: true });
+    const page = store.catalog.queryObjects({
+      connectionId: 'profile-1', schema: 'PUBLIC', prefix: 'emp', limit: 10,
+    });
+    expect(page.objects.map((object) => object.name)).toEqual(['employee_details', 'employees']);
+    expect(store.catalog.getColumns('profile-1', 'PUBLIC', 'employees')).toHaveLength(1);
+    store.catalog.invalidateConnection('profile-1');
+    expect(store.catalog.queryObjects({
+      connectionId: 'profile-1', schema: 'PUBLIC', prefix: '', limit: 10,
+    }).objects).toHaveLength(0);
     store.close();
   });
 });

@@ -7,5 +7,7 @@
 /playwright-report/
 /test-results/
 /.playwright-mcp/
+/tools/autocompletion-bench/harness
+/tools/autocompletion-bench/harness.exe
 *.log
 .DS_Store

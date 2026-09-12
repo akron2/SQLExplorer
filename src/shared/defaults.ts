@@ -1,11 +1,31 @@
 import type {
-  MetadataSnapshot,
   PublicConnectionProfile,
   SqlDocument,
+  UiSettings,
   WorkspaceSnapshot,
+} from './contracts';
+import {
+  EDITOR_FONT_SIZE_DEFAULT,
+  EDITOR_FONT_SIZE_MAX,
+  EDITOR_FONT_SIZE_MIN,
+  UI_SCALE_STEPS,
 } from './contracts';
 
 const now = () => new Date().toISOString();
+
+export const DEFAULT_UI_SETTINGS: UiSettings = {
+  editorFontSize: EDITOR_FONT_SIZE_DEFAULT,
+  interfaceScale: 1,
+};
+
+export function normalizeUiSettings(value: unknown): UiSettings {
+  const raw = value && typeof value === 'object' ? value as Partial<UiSettings> : {};
+  const scale = UI_SCALE_STEPS.find((step) => step === raw.interfaceScale) ?? DEFAULT_UI_SETTINGS.interfaceScale;
+  const fontSize = typeof raw.editorFontSize === 'number' && Number.isFinite(raw.editorFontSize)
+    ? Math.min(EDITOR_FONT_SIZE_MAX, Math.max(EDITOR_FONT_SIZE_MIN, Math.round(raw.editorFontSize)))
+    : DEFAULT_UI_SETTINGS.editorFontSize;
+  return { editorFontSize: fontSize, interfaceScale: scale };
+}
 
 const oracleSql = `select
   e.employee_id,
@@ -36,36 +56,6 @@ export const defaultConnections: PublicConnectionProfile[] = [
   },
 ];
 
-export const defaultMetadata: MetadataSnapshot[] = [
-  {
-    connectionId: 'oracle-local', schema: 'SQLX', fetchedAt: now(), objects: [
-      { kind: 'table', schema: 'SQLX', name: 'EMPLOYEES', columns: [
-        { name: 'EMPLOYEE_ID', dataType: 'NUMBER(10)', nullable: false, position: 1 },
-        { name: 'DEPARTMENT_ID', dataType: 'NUMBER(10)', nullable: true, position: 2 },
-        { name: 'FULL_NAME', dataType: 'VARCHAR2(120)', nullable: false, position: 3 },
-        { name: 'SALARY', dataType: 'NUMBER(18,4)', nullable: true, position: 4 },
-        { name: 'HIRED_AT', dataType: 'TIMESTAMP', nullable: true, position: 5 },
-        { name: 'NOTES', dataType: 'CLOB', nullable: true, position: 6 },
-      ] },
-      { kind: 'table', schema: 'SQLX', name: 'DEPARTMENTS', columns: [
-        { name: 'DEPARTMENT_ID', dataType: 'NUMBER(10)', nullable: false, position: 1 },
-        { name: 'DEPARTMENT_NAME', dataType: 'VARCHAR2(100)', nullable: false, position: 2 },
-      ] },
-      { kind: 'view', schema: 'SQLX', name: 'EMPLOYEE_DETAILS' },
-      { kind: 'package', schema: 'SQLX', name: 'DEMO_PKG' },
-      { kind: 'synonym', schema: 'SQLX', name: 'STAFF' },
-      { kind: 'sequence', schema: 'SQLX', name: 'EMPLOYEE_ID_SEQ' },
-    ],
-  },
-  {
-    connectionId: 'postgres-local', schema: 'public', fetchedAt: now(), objects: [
-      { kind: 'table', schema: 'public', name: 'employees' },
-      { kind: 'table', schema: 'public', name: 'departments' },
-      { kind: 'view', schema: 'public', name: 'employee_details' },
-    ],
-  },
-];
-
 function makeDocument(
   index: number,
   connectionId: string | null,
@@ -84,7 +74,7 @@ function makeDocument(
 export function createDefaultWorkspace(connection?: PublicConnectionProfile): WorkspaceSnapshot {
   const document = makeDocument(1, connection?.id ?? null, 'SQL 1', '', connection?.kind ?? 'sql');
   return {
-    schemaVersion: 2, activeDocumentId: document.id, closedDocuments: [], documents: [document],
+    schemaVersion: 3, activeDocumentId: document.id, closedDocuments: [], documents: [document],
     explorerConnectionId: connection?.id ?? null, explorerVisible: true,
     resultPanelHeight: 268, theme: 'system',
   };
@@ -97,7 +87,7 @@ export function createDemoWorkspace(): WorkspaceSnapshot {
     makeDocument(3, 'oracle-local', 'Черновик', 'select * from employee_details;', 'oracle'),
   ];
   return {
-    schemaVersion: 2, activeDocumentId: documents[0].id, closedDocuments: [], documents,
+    schemaVersion: 3, activeDocumentId: documents[0].id, closedDocuments: [], documents,
     explorerConnectionId: 'oracle-local', explorerVisible: true, resultPanelHeight: 268, theme: 'system',
   };
 }

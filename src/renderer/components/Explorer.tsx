@@ -1,43 +1,45 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
-  Boxes, Braces, ChevronDown, ChevronRight, Clock3, Database, Eye, FunctionSquare,
-  KeyRound, Package, Pencil, Plus, RefreshCw, Search, Settings2, Table2,
+  Boxes, Braces, Clock3, Database, Eye, FunctionSquare, KeyRound, Package, Pencil, Plus,
+  RefreshCw, Search, Settings2, Table2,
 } from 'lucide-react';
 import type {
-  MetadataObject,
-  MetadataSnapshot,
+  CatalogListRequest,
+  CatalogListResult,
+  CatalogObjectKind,
+  CatalogObjectSummary,
+  CatalogSchemaSummary,
   PublicConnectionProfile,
   SessionState,
 } from '../../shared/contracts';
 
 interface ExplorerProps {
+  catalogList(request: CatalogListRequest): Promise<CatalogListResult>;
   connections: PublicConnectionProfile[];
-  metadata?: MetadataSnapshot;
   nativeMenus: boolean;
   onAddConnection(): void;
-  onConnectionMenu(connectionId: string): void;
   onConnectionAction(connectionId: string, action: 'newDocument' | 'test' | 'edit' | 'reconnect' | 'disconnect' | 'delete'): void;
+  onConnectionMenu(connectionId: string): void;
   onEditConnection(connectionId: string): void;
   onOpenSettings(): void;
-  onRefresh(): void;
+  onRefresh(schema?: string): void;
   onSelectConnection(connectionId: string): void;
   refreshing: boolean;
   selectedConnectionId: string | null;
   sessionStates: SessionState[];
 }
 
-const groupDefinitions: Array<{
-  icon: typeof Table2;
-  kind: MetadataObject['kind'];
-  label: string;
-}> = [
-  { kind: 'table', label: 'Таблицы', icon: Table2 },
-  { kind: 'view', label: 'Представления', icon: Eye },
-  { kind: 'package', label: 'Пакеты', icon: Package },
-  { kind: 'function', label: 'Функции', icon: FunctionSquare },
-  { kind: 'synonym', label: 'Синонимы', icon: Boxes },
-  { kind: 'sequence', label: 'Последовательности', icon: Braces },
-];
+const kindMeta: Record<CatalogObjectKind, { icon: typeof Table2; label: string }> = {
+  table: { icon: Table2, label: 'таблица' },
+  view: { icon: Eye, label: 'представление' },
+  matview: { icon: Eye, label: 'мат. представление' },
+  package: { icon: Package, label: 'пакет' },
+  function: { icon: FunctionSquare, label: 'функция' },
+  procedure: { icon: FunctionSquare, label: 'процедура' },
+  synonym: { icon: Boxes, label: 'синоним' },
+  sequence: { icon: Braces, label: 'последовательность' },
+  type: { icon: Braces, label: 'тип' },
+};
 
 function aggregateStatus(connectionId: string, states: SessionState[]) {
   const relevant = states.filter((state) => state.connectionId === connectionId && state.status !== 'disconnected');
@@ -52,8 +54,8 @@ function aggregateStatus(connectionId: string, states: SessionState[]) {
 }
 
 export function Explorer({
+  catalogList,
   connections,
-  metadata,
   nativeMenus,
   onAddConnection,
   onConnectionMenu,
@@ -66,30 +68,101 @@ export function Explorer({
   selectedConnectionId,
   sessionStates,
 }: ExplorerProps) {
-  const [filter, setFilter] = useState('');
-  const [expandedGroups, setExpandedGroups] = useState(() => new Set(['table']));
-  const [expandedObjects, setExpandedObjects] = useState(() => new Set<string>());
+  const [schemaData, setSchemaData] = useState<{ key: string; schemas: CatalogSchemaSummary[] }>({
+    key: '',
+    schemas: [],
+  });
+  const [selectedSchema, setSelectedSchema] = useState<string>();
+  const [search, setSearch] = useState('');
+  const [objectData, setObjectData] = useState<{
+    hasMore: boolean;
+    key: string;
+    objects: CatalogObjectSummary[];
+  }>({ hasMore: false, key: '', objects: [] });
+  const [loading, setLoading] = useState(false);
+  const [catalogError, setCatalogError] = useState<string>();
   const [fallbackConnectionMenu, setFallbackConnectionMenu] = useState<string>();
-  const groups = useMemo(() => {
-    const value = filter.trim().toLocaleLowerCase();
-    return groupDefinitions.map((definition) => ({
-      ...definition,
-      objects: (metadata?.objects ?? []).filter((object) =>
-        object.kind === definition.kind && (!value || object.name.toLocaleLowerCase().includes(value)
-          || object.columns?.some((column) => column.name.toLocaleLowerCase().includes(value)))),
-    })).filter((group) => group.objects.length > 0);
-  }, [filter, metadata]);
+  const loadToken = useRef(0);
 
-  const toggleGroup = (kind: string) => setExpandedGroups((current) => {
-    const next = new Set(current);
-    if (next.has(kind)) next.delete(kind); else next.add(kind);
-    return next;
-  });
-  const toggleObject = (name: string) => setExpandedObjects((current) => {
-    const next = new Set(current);
-    if (next.has(name)) next.delete(name); else next.add(name);
-    return next;
-  });
+  useEffect(() => {
+    if (!selectedConnectionId || refreshing) return;
+    let active = true;
+    void catalogList({ connectionId: selectedConnectionId, kind: 'schemas', limit: 500 })
+      .then((result) => {
+        if (!active) return;
+        const next = result.schemas ?? [];
+        setSchemaData({ key: selectedConnectionId, schemas: next });
+        setCatalogError(undefined);
+        setSelectedSchema((current) => {
+          if (current && next.some((schema) => schema.name === current)) return current;
+          return next.find((schema) => schema.isDefault)?.name ?? next[0]?.name;
+        });
+      })
+      .catch((error: unknown) => {
+        if (active) setCatalogError(error instanceof Error ? error.message : String(error));
+      });
+    return () => { active = false; };
+  }, [catalogList, refreshing, selectedConnectionId]);
+
+  const activeSchemas = selectedConnectionId && schemaData.key === selectedConnectionId
+    ? schemaData.schemas
+    : [];
+  const objectKey = selectedConnectionId && selectedSchema
+    ? `${selectedConnectionId}\u0000${selectedSchema}\u0000${search.trim()}`
+    : '';
+  const activeObjects = objectData.key === objectKey ? objectData.objects : [];
+  const activeHasMore = objectData.key === objectKey && objectData.hasMore;
+  const objectsLoading = loading && objectData.key !== objectKey;
+
+  useEffect(() => {
+    if (!objectKey || !selectedConnectionId || !selectedSchema || refreshing) return;
+    const token = ++loadToken.current;
+    const timeout = window.setTimeout(() => {
+      setLoading(true);
+      void catalogList({
+        connectionId: selectedConnectionId,
+        kind: 'objects',
+        schema: selectedSchema,
+        search: search.trim() || undefined,
+        limit: 200,
+      }).then((result) => {
+        if (token !== loadToken.current) return;
+        setObjectData({ key: objectKey, objects: result.objects ?? [], hasMore: result.hasMore });
+        setCatalogError(undefined);
+      }).catch((error: unknown) => {
+        if (token === loadToken.current) setCatalogError(error instanceof Error ? error.message : String(error));
+      }).finally(() => {
+        if (token === loadToken.current) setLoading(false);
+      });
+    }, search ? 250 : 0);
+    return () => window.clearTimeout(timeout);
+  }, [catalogList, objectKey, refreshing, search, selectedConnectionId, selectedSchema]);
+
+  const loadMore = () => {
+    if (!selectedConnectionId || !selectedSchema || loading || !objectKey) return;
+    const token = loadToken.current;
+    setLoading(true);
+    void catalogList({
+      connectionId: selectedConnectionId,
+      kind: 'objects',
+      schema: selectedSchema,
+      search: search.trim() || undefined,
+      limit: 200,
+      offset: activeObjects.length,
+    }).then((result) => {
+      if (token !== loadToken.current) return;
+      setObjectData((current) => ({
+        key: objectKey,
+        objects: [...(current.key === objectKey ? current.objects : []), ...(result.objects ?? [])],
+        hasMore: result.hasMore,
+      }));
+      setCatalogError(undefined);
+    }).catch((error: unknown) => {
+      if (token === loadToken.current) setCatalogError(error instanceof Error ? error.message : String(error));
+    }).finally(() => {
+      if (token === loadToken.current) setLoading(false);
+    });
+  };
 
   return (
     <aside className="explorer" aria-label="Проводник соединений и объектов">
@@ -118,18 +191,34 @@ export function Explorer({
         })}
         {connections.length === 0 && <button className="empty-connections" type="button" onClick={onAddConnection}><Database size={20} /><strong>Нет соединений</strong><span>Добавить Oracle или PostgreSQL</span></button>}
       </div>
-      <label className="object-filter"><Search size={15} /><input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Найти объект…" aria-label="Найти объект" disabled={!selectedConnectionId} /></label>
-      <div className="schema-line"><span className="schema-name"><Database size={14} /> {metadata?.schema ?? 'Нет метаданных'}</span><span>{metadata?.objects.length ?? 0} объектов{metadata?.stale ? ' · кэш' : ''}</span><button className="icon-button compact" type="button" onClick={onRefresh} disabled={refreshing || !selectedConnectionId} title="Получить метаданные из БД"><RefreshCw className={refreshing ? 'spin' : ''} size={14} /></button></div>
-      <div className="object-tree">
-        {groups.map((group) => {
-          const expanded = expandedGroups.has(group.kind);
-          const Icon = group.icon;
-          return <div className="object-group" key={group.kind}><button className="tree-row group-row" type="button" onClick={() => toggleGroup(group.kind)}>{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}<Icon size={14} /><strong>{group.label}</strong><span>{group.objects.length}</span></button>{expanded && group.objects.map((object) => {
-            const objectExpanded = expandedObjects.has(`${object.schema}.${object.name}`);
-            return <div key={`${object.schema}.${object.name}`}><button className={`tree-row object-row ${objectExpanded ? 'is-selected' : ''}`} type="button" onClick={() => toggleObject(`${object.schema}.${object.name}`)}>{object.columns?.length ? objectExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} /> : <span className="tree-spacer" />}<Icon size={14} /><span>{object.name}</span></button>{objectExpanded && object.columns?.map((column) => <div className="tree-row column-row" key={column.name}><span className="column-name">{column.name}</span><span className="column-type">{column.dataType}</span></div>)}</div>;
-          })}</div>;
-        })}
-        {selectedConnectionId && groups.length === 0 && <div className="empty-tree">{metadata ? 'Объекты не найдены' : 'Подключитесь и обновите метаданные'}</div>}
+      <div className="catalog-section">
+        <div className="schema-line"><span className="schema-name"><Database size={14} /> Схемы</span><span>{activeSchemas.length}</span><button className="icon-button compact" type="button" onClick={() => onRefresh()} disabled={refreshing || !selectedConnectionId} title="Обновить каталог"><RefreshCw className={refreshing ? 'spin' : ''} size={14} /></button></div>
+        <div className="schema-list">
+          {activeSchemas.map((schema) => <div key={schema.name} className={`schema-row ${schema.name === selectedSchema ? 'is-selected' : ''}`}>
+            <button className="schema-row-main" type="button" onClick={() => setSelectedSchema(schema.name)} title={schema.name}>
+              <span className="schema-row-name">{schema.name}{schema.isDefault && <b className="default-schema">по умолчанию</b>}</span>
+              <small>{schema.loaded ? `${schema.objectCount} объектов` : 'загрузка по запросу'}{schema.stale ? ' · устарело' : ''}</small>
+            </button>
+            <button className="icon-button compact" type="button" onClick={() => onRefresh(schema.name)} disabled={refreshing} title={`Обновить схему ${schema.name}`} aria-label={`Обновить схему ${schema.name}`}><RefreshCw size={12} /></button>
+          </div>)}
+          {selectedConnectionId && activeSchemas.length === 0 && !catalogError && <div className="empty-tree">Схемы не найдены</div>}
+        </div>
+        <label className="object-filter"><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Найти объект…" aria-label="Найти объект" disabled={!selectedSchema} /></label>
+        <div className="object-list">
+          {activeObjects.map((object) => {
+            const meta = kindMeta[object.kind];
+            const Icon = meta.icon;
+            return <div className="object-row-mini" key={`${object.schema}.${object.kind}.${object.name}`} title={`${meta.label} ${object.schema}.${object.name}`}>
+              <Icon size={13} />
+              <span>{object.name}</span>
+              <small>{object.kind}</small>
+            </div>;
+          })}
+          {activeHasMore && <button className="load-more" type="button" onClick={loadMore} disabled={objectsLoading}>{objectsLoading ? 'Загрузка…' : 'Показать ещё'}</button>}
+          {selectedSchema && activeObjects.length === 0 && !objectsLoading && <div className="empty-tree">{search.trim() ? 'Объекты не найдены' : 'В схеме нет объектов'}</div>}
+          {!selectedSchema && <div className="empty-tree">Выберите схему</div>}
+        </div>
+        {catalogError && <div className="catalog-error">{catalogError}</div>}
       </div>
       <button className="history-button" type="button"><Clock3 size={15} /> История запросов</button>
     </aside>

@@ -27,7 +27,7 @@ test('starts the Electron shell and executes against both live databases', async
       node: process.versions.node,
       version: app.getVersion(),
     }));
-    expect(versions).toMatchObject({ electron: '44.3.0', version: '0.1.0' });
+    expect(versions).toMatchObject({ electron: '44.3.0', version: '0.1.6' });
 
     const editor = page.getByTestId('sql-editor');
     await editor.click();
@@ -124,7 +124,7 @@ test('persists a UI-created profile while keeping its password out of plaintext 
   try {
     const page = await first.firstWindow();
     await expect(page.getByText('Нет соединений', { exact: true })).toBeVisible();
-    await expect(page.getByText('Нет метаданных', { exact: true })).toBeVisible();
+    await expect(page.locator('.schema-line')).toContainText('Схемы');
     await page.getByRole('button', { name: 'Добавить соединение' }).click();
     const dialog = page.getByRole('dialog', { name: 'Новое соединение' });
     await dialog.getByLabel('Название соединения').fill('Persistent reports');
@@ -306,5 +306,47 @@ test('shows a lost PostgreSQL session and reconnects on the next explicit execut
     await expect(serverStatus).toHaveClass(/connected/u);
   } finally {
     await application.evaluate(({ app }) => app.exit(0)).catch(() => undefined);
+  }
+});
+
+test('persists interface scale and editor font size across restarts', async ({ browserName: _browserName }, testInfo) => {
+  const userData = testInfo.outputPath('user-data');
+  const launch = () => electron.launch({
+    executablePath: path.join(projectRoot, 'node_modules', 'electron', 'dist', 'electron.exe'),
+    args: [projectRoot],
+    cwd: projectRoot,
+    env: { ...process.env, SQLX_TEST_USER_DATA: userData },
+  });
+
+  const first = await launch();
+  try {
+    const page = await first.firstWindow();
+    await expect(page.getByTestId('sql-editor')).toBeVisible();
+    await page.getByRole('button', { name: 'Вид и шрифт' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Вид и шрифт' });
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole('radio', { name: '150%' }).click();
+    await dialog.getByRole('button', { name: 'Увеличить шрифт редактора' }).click();
+    await expect(dialog.locator('.font-size-value')).toHaveText('15px');
+    await expect.poll(() => page.evaluate(() => document.documentElement.style.getPropertyValue('--ui-scale'))).toBe('1.5');
+    await expect.poll(() => page.locator('.monaco-editor .view-lines').evaluate((element) => getComputedStyle(element).fontSize)).toBe('15px');
+    await dialog.getByRole('button', { name: 'Готово' }).click();
+    await page.waitForTimeout(600);
+  } finally {
+    await first.evaluate(({ app }) => app.exit(0)).catch(() => undefined);
+  }
+
+  const second = await launch();
+  try {
+    const page = await second.firstWindow();
+    await expect(page.getByTestId('sql-editor')).toBeVisible();
+    await expect.poll(() => page.evaluate(() => document.documentElement.style.getPropertyValue('--ui-scale'))).toBe('1.5');
+    await expect.poll(() => page.locator('.monaco-editor .view-lines').evaluate((element) => getComputedStyle(element).fontSize)).toBe('15px');
+    await page.getByRole('button', { name: 'Вид и шрифт' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Вид и шрифт' });
+    await expect(dialog.getByRole('radio', { name: '150%' })).toHaveAttribute('aria-checked', 'true');
+    await expect(dialog.locator('.font-size-value')).toHaveText('15px');
+  } finally {
+    await second.evaluate(({ app }) => app.exit(0)).catch(() => undefined);
   }
 });

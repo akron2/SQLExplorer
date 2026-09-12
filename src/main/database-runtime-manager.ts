@@ -1,15 +1,20 @@
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import type {
+  CatalogColumn,
+  CatalogObjectPage,
+  CatalogObjectQuery,
+  CatalogOverview,
   ConnectionProfile,
   ConnectionTestResult,
   DatabaseRuntimeConfiguration,
   ExecuteRequest,
   FetchMoreRequest,
-  MetadataSnapshot,
   QueryPage,
+  SessionContextResult,
   SessionRequest,
   SessionState,
+  SetSessionSchemaRequest,
   TransactionRequest,
 } from '../shared/contracts';
 import { DatabaseWorkerClient, type DatabaseWorkerEvent } from './db-worker-client';
@@ -140,13 +145,58 @@ export class DatabaseRuntimeManager extends EventEmitter {
     }
   }
 
-  async refreshMetadata(profile: ConnectionProfile): Promise<MetadataSnapshot> {
+  async catalogOverview(profile: ConnectionProfile): Promise<CatalogOverview> {
     const client = this.#clientFor(profile);
     try {
-      return await client.call<MetadataSnapshot>('refreshMetadata', { profile });
+      return await client.call<CatalogOverview>('catalogOverview', { profile });
     } finally {
       this.#scheduleIdleClose(client.runtimeKey);
     }
+  }
+
+  async countSchemaObjects(profile: ConnectionProfile, schema: string): Promise<number> {
+    const client = this.#clientFor(profile);
+    try {
+      return await client.call<number>('countSchemaObjects', { profile, schema });
+    } finally {
+      this.#scheduleIdleClose(client.runtimeKey);
+    }
+  }
+
+  async listObjects(profile: ConnectionProfile, query: CatalogObjectQuery): Promise<CatalogObjectPage> {
+    const client = this.#clientFor(profile);
+    try {
+      return await client.call<CatalogObjectPage>('listObjects', { profile, query });
+    } finally {
+      this.#scheduleIdleClose(client.runtimeKey);
+    }
+  }
+
+  async listColumns(profile: ConnectionProfile, schema: string, object: string): Promise<CatalogColumn[]> {
+    const client = this.#clientFor(profile);
+    try {
+      return await client.call<CatalogColumn[]>('listColumns', { profile, schema, object });
+    } finally {
+      this.#scheduleIdleClose(client.runtimeKey);
+    }
+  }
+
+  async sessionContext(
+    profile: ConnectionProfile,
+    request: Pick<SessionRequest, 'connectionId' | 'documentId'>,
+  ): Promise<SessionContextResult | undefined> {
+    const client = this.#clientForCurrentSession(request.documentId);
+    if (!client) return undefined;
+    return client.call<SessionContextResult | undefined>('sessionContext', { profile, request });
+  }
+
+  async setSessionSchema(
+    profile: ConnectionProfile,
+    request: SetSessionSchemaRequest,
+  ): Promise<SessionContextResult | undefined> {
+    const client = this.#clientForCurrentSession(request.documentId);
+    if (!client) return undefined;
+    return client.call<SessionContextResult | undefined>('setSessionSchema', { profile, request });
   }
 
   async listTnsAliases(configDir: string): Promise<string[]> {

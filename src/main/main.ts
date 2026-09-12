@@ -2,6 +2,7 @@ import path from 'node:path';
 import {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
   Menu,
   nativeTheme,
@@ -12,7 +13,14 @@ import {
 import type {
   AppMetric,
   BootstrapPayload,
+  CatalogAccessContext,
+  CatalogConnectionState,
+  CatalogListRequest,
+  CatalogListResult,
+  CatalogRefreshRequest,
+  CatalogContextRequest,
   ConnectionMenuAction,
+  ConnectionProfile,
   ConnectionProfileInput,
   ConnectionTestRequest,
   DatabaseErrorInfo,
@@ -27,22 +35,32 @@ import type {
   SaveSqlFileRequest,
   SessionRequest,
   SessionState,
+  SetSessionSchemaRequest,
+  SqlCompletionRequest,
+  SqlCompletionResult,
   TransactionRequest,
+  UiSettings,
   WorkspaceSnapshot,
 } from '../shared/contracts';
 import { IPC_CHANNELS } from '../shared/contracts';
+import { CatalogLoader } from './catalog-loader';
+import { CompletionService } from './completion-service';
 import { ConnectionRegistry } from './connection-registry';
 import { DatabaseRuntimeManager } from './database-runtime-manager';
 import { runDatabaseSelfTest } from './database-self-test';
 import { DatabaseOperationError } from './db-worker-client';
 import { ElectronSecretStorage } from './secret-storage';
+import { SessionContextCache } from './session-context';
 import { SqlFileService } from './sql-file-service';
 import { WorkspaceStore } from './workspace-store';
 
 const testUserData = process.env.SQLX_TEST_USER_DATA;
 if (testUserData) app.setPath('userData', testUserData);
 
+let catalogLoader: CatalogLoader | undefined;
+let completionService: CompletionService | undefined;
 let databaseRuntime: DatabaseRuntimeManager | undefined;
+let sessionContexts: SessionContextCache | undefined;
 let workspaceStore: WorkspaceStore | undefined;
 let connectionRegistry: ConnectionRegistry | undefined;
 let sqlFileService: SqlFileService | undefined;
@@ -65,10 +83,47 @@ function connectionConfigRoot(): string {
 }
 
 function requireServices() {
-  if (!databaseRuntime || !workspaceStore || !connectionRegistry || !sqlFileService) {
+  if (!databaseRuntime || !workspaceStore || !connectionRegistry || !sqlFileService
+    || !catalogLoader || !completionService || !sessionContexts) {
     throw new Error('Application services are not initialized');
   }
-  return { databaseRuntime, workspaceStore, connectionRegistry, sqlFileService };
+  return {
+    databaseRuntime, workspaceStore, connectionRegistry, sqlFileService,
+    catalogLoader, completionService, sessionContexts,
+  };
+}
+
+async function profileForCatalog(connectionId: string): Promise<ConnectionProfile | undefined> {
+  try {
+    return await requireServices().connectionRegistry.get(connectionId);
+  } catch {
+    return undefined;
+  }
+}
+
+async function refreshSessionContext(profile: ConnectionProfile, documentId: string): Promise<CatalogAccessContext | undefined> {
+  const services = requireServices();
+  try {
+    const context = await services.databaseRuntime.sessionContext(profile, {
+      connectionId: profile.id,
+      documentId,
+    });
+    if (context) services.sessionContexts.setSession(profile.id, documentId, context);
+    return services.sessionContexts.get(profile.id, documentId);
+  } catch {
+    return undefined;
+  }
+}
+
+function defaultContext(connectionId: string, username: string, dialect: string, schema?: string): CatalogAccessContext {
+  return {
+    connectionId,
+    userName: username,
+    currentSchema: schema ?? (dialect === 'oracle' ? username.toUpperCase() : 'public'),
+    searchPath: [],
+    source: 'default',
+    fetchedAt: new Date().toISOString(),
+  };
 }
 
 function assertTrustedSender(event: IpcMainInvokeEvent): void {
@@ -191,12 +246,11 @@ function registerIpc(): void {
     };
     return {
       connections,
-      metadata: services.workspaceStore.listMetadata()
-        .filter((snapshot) => connectionIds.has(snapshot.connectionId)),
       oracleClients: services.connectionRegistry.oracleClients(),
       oracleSettings: services.connectionRegistry.oracleSettings(),
       platform: process.platform,
       sessionStates: services.databaseRuntime.states(),
+      uiSettings: services.workspaceStore.loadUiSettings(),
       version: app.getVersion(),
       workspace,
     };
@@ -205,6 +259,9 @@ function registerIpc(): void {
   handle(IPC_CHANNELS.saveWorkspace, (_event, snapshot: WorkspaceSnapshot) => {
     requireServices().workspaceStore.saveWorkspace(snapshot);
   });
+
+  handle(IPC_CHANNELS.saveUiSettings, (_event, settings: UiSettings) =>
+    requireServices().workspaceStore.saveUiSettings(settings));
 
   handle(IPC_CHANNELS.confirmAppClose, (event, allow: boolean) => {
     const window = windowFor(event);
@@ -217,6 +274,8 @@ function registerIpc(): void {
     const services = requireServices();
     const profile = await services.connectionRegistry.save(input);
     services.databaseRuntime.markProfileOutdated(profile.id, profile.profileVersion);
+    services.catalogLoader.invalidateConnection(profile.id);
+    services.sessionContexts.clearConnection(profile.id);
     return profile;
   });
 
@@ -229,7 +288,9 @@ function registerIpc(): void {
     await Promise.all(sessions.map((state) => services.databaseRuntime.disconnect(profile, {
       connectionId, documentId: state.documentId, force: false,
     })));
+    for (const state of sessions) services.sessionContexts.clearDocument(state.documentId);
     services.connectionRegistry.delete(connectionId);
+    services.catalogLoader.invalidateConnection(connectionId);
   });
 
   handle(IPC_CHANNELS.saveOracleSettings, (_event, settings: OracleSettings) => {
@@ -261,19 +322,30 @@ function registerIpc(): void {
 
   databaseHandle(IPC_CHANNELS.connect, async (_event, request: SessionRequest) => {
     const services = requireServices();
-    return services.databaseRuntime.connect(await services.connectionRegistry.get(request.connectionId), request);
+    const profile = await services.connectionRegistry.get(request.connectionId);
+    const state = await services.databaseRuntime.connect(profile, request);
+    await refreshSessionContext(profile, request.documentId);
+    return state;
   });
   databaseHandle(IPC_CHANNELS.disconnect, async (_event, request: SessionRequest) => {
     const services = requireServices();
-    return services.databaseRuntime.disconnect(services.connectionRegistry.sessionProfile(request.connectionId), request);
+    const state = await services.databaseRuntime.disconnect(services.connectionRegistry.sessionProfile(request.connectionId), request);
+    services.sessionContexts.clearDocument(request.documentId);
+    return state;
   });
   databaseHandle(IPC_CHANNELS.reconnect, async (_event, request: SessionRequest) => {
     const services = requireServices();
-    return services.databaseRuntime.reconnect(await services.connectionRegistry.get(request.connectionId), request);
+    const profile = await services.connectionRegistry.get(request.connectionId);
+    const state = await services.databaseRuntime.reconnect(profile, request);
+    await refreshSessionContext(profile, request.documentId);
+    return state;
   });
   databaseHandle(IPC_CHANNELS.execute, async (_event, request: ExecuteRequest) => {
     const services = requireServices();
-    return services.databaseRuntime.execute(await services.connectionRegistry.get(request.connectionId), request);
+    const profile = await services.connectionRegistry.get(request.connectionId);
+    const page = await services.databaseRuntime.execute(profile, request);
+    await refreshSessionContext(profile, request.documentId);
+    return page;
   });
   databaseHandle(IPC_CHANNELS.fetchMore, async (_event, request: FetchMoreRequest) =>
     requireServices().databaseRuntime.fetchMore(request));
@@ -287,13 +359,95 @@ function registerIpc(): void {
     const services = requireServices();
     await services.databaseRuntime.rollback(services.connectionRegistry.sessionProfile(request.connectionId), request);
   });
-  databaseHandle(IPC_CHANNELS.refreshMetadata, async (_event, connectionId: string) => {
+  databaseHandle(IPC_CHANNELS.catalogList, async (_event, request: CatalogListRequest): Promise<CatalogListResult> => {
     const services = requireServices();
-    const snapshot = await services.databaseRuntime.refreshMetadata(
-      await services.connectionRegistry.get(connectionId),
+    await services.catalogLoader.ensureOverview(request.connectionId);
+    const limit = Math.max(1, Math.min(500, Math.trunc(request.limit ?? 200)));
+    const offset = Math.max(0, Math.trunc(request.offset ?? 0));
+    if (request.kind === 'schemas') {
+      const schemas = services.catalogLoader.listSchemas(request.connectionId, request.search);
+      return {
+        schemas: schemas.slice(offset, offset + limit),
+        total: schemas.length,
+        hasMore: offset + limit < schemas.length,
+      };
+    }
+    if (!request.schema) return { hasMore: false, objects: [], total: 0 };
+    const result = await services.catalogLoader.objects(request.connectionId, request.schema, {
+      prefix: request.search ?? '',
+      substring: true,
+      caseSensitive: false,
+      kinds: request.objectKinds,
+      limit,
+      offset,
+    });
+    return {
+      hasMore: result.hasMore,
+      objects: result.objects,
+      total: result.hasMore ? -1 : offset + result.objects.length,
+    };
+  });
+  databaseHandle(IPC_CHANNELS.catalogRefresh, async (_event, request: CatalogRefreshRequest) => {
+    const services = requireServices();
+    const state = await services.catalogLoader.refresh(request);
+    const context = services.catalogLoader.context(request.connectionId);
+    if (context) services.sessionContexts.setCatalog(request.connectionId, context);
+    return state;
+  });
+  databaseHandle(IPC_CHANNELS.catalogContext, async (_event, request: CatalogContextRequest) => {
+    const services = requireServices();
+    const cached = services.sessionContexts.get(request.connectionId, request.documentId);
+    if (cached) return cached;
+    await services.catalogLoader.ensureOverview(request.connectionId);
+    const context = services.catalogLoader.context(request.connectionId);
+    if (context) {
+      services.sessionContexts.setCatalog(request.connectionId, context);
+      return { ...context, connectionId: request.connectionId };
+    }
+    const profile = services.connectionRegistry.list().find((entry) => entry.id === request.connectionId);
+    return defaultContext(request.connectionId, profile?.username ?? '', profile?.kind ?? 'sql');
+  });
+  databaseHandle(IPC_CHANNELS.setSessionSchema, async (_event, request: SetSessionSchemaRequest) => {
+    const services = requireServices();
+    let profile: ConnectionProfile | undefined;
+    let publicProfile: ConnectionProfile | undefined;
+    try {
+      profile = await services.connectionRegistry.get(request.connectionId);
+    } catch {
+      const known = services.connectionRegistry.list().find((entry) => entry.id === request.connectionId);
+      if (known) publicProfile = { ...known, password: '' };
+    }
+    const context = profile
+      ? await services.databaseRuntime.setSessionSchema(profile, request).catch(() => undefined)
+      : undefined;
+    if (context && profile) {
+      services.sessionContexts.setSession(profile.id, request.documentId, context);
+      return services.sessionContexts.get(profile.id, request.documentId);
+    }
+    const fallbackProfile = profile ?? publicProfile;
+    return defaultContext(
+      request.connectionId,
+      fallbackProfile?.username ?? '',
+      fallbackProfile?.kind ?? 'sql',
+      request.schema,
     );
-    services.workspaceStore.saveMetadata(snapshot);
-    return snapshot;
+  });
+  handle(IPC_CHANNELS.catalogComplete, async (_event, request: SqlCompletionRequest): Promise<SqlCompletionResult> => {
+    try {
+      const services = requireServices();
+      let fallback: CatalogAccessContext | undefined;
+      const context = request.connectionId
+        ? services.sessionContexts.get(request.connectionId, request.documentId)
+        : undefined;
+      if (request.connectionId && !context) {
+        const profile = services.connectionRegistry.list().find((entry) => entry.id === request.connectionId);
+        if (profile) fallback = defaultContext(profile.id, profile.username, profile.kind);
+        void services.catalogLoader.ensureOverview(request.connectionId).catch(() => undefined);
+      }
+      return await services.completionService.complete(request, context ?? fallback);
+    } catch {
+      return { items: [], incomplete: false, source: 'none' };
+    }
   });
   databaseHandle(IPC_CHANNELS.listTnsAliases, async (_event, configDir: string) =>
     requireServices().databaseRuntime.listTnsAliases(configDir));
@@ -445,6 +599,19 @@ void app.whenReady().then(async () => {
   await connectionRegistry.initialize();
   databaseRuntime = new DatabaseRuntimeManager(__dirname);
   sqlFileService = new SqlFileService(workspaceStore);
+  sessionContexts = new SessionContextCache();
+  catalogLoader = new CatalogLoader(workspaceStore.catalog, databaseRuntime, (connectionId) =>
+    profileForCatalog(connectionId));
+  completionService = new CompletionService(catalogLoader, sessionContexts);
+  catalogLoader.on('state', (state: CatalogConnectionState) => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      window.webContents.send(IPC_CHANNELS.catalogStateChanged, state);
+    }
+    if (state.phase === 'ready' && sessionContexts) {
+      const context = catalogLoader?.context(state.connectionId);
+      if (context) sessionContexts.setCatalog(state.connectionId, context);
+    }
+  });
   databaseRuntime.on('session-state', (state: SessionState) => {
     for (const window of BrowserWindow.getAllWindows()) {
       window.webContents.send(IPC_CHANNELS.sessionStateChanged, state);
@@ -473,6 +640,16 @@ void app.whenReady().then(async () => {
   await createWindow();
 }).catch((error: unknown) => {
   console.error(error);
+  const automatedRun = process.argv.includes('--smoke-test')
+    || process.argv.includes('--database-test');
+  if (!automatedRun) {
+    dialog.showErrorBox(
+      'SQLExplorer: не удалось запустить приложение',
+      `Приложение завершает работу из-за ошибки запуска.\n\n`
+      + `${error instanceof Error ? error.message : String(error)}\n\n`
+      + `Пользовательские данные: ${app.getPath('userData')}`,
+    );
+  }
   app.exit(1);
 });
 

@@ -2,6 +2,12 @@ import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type {
   AppMetric,
   BootstrapPayload,
+  CatalogAccessContext,
+  CatalogConnectionState,
+  CatalogContextRequest,
+  CatalogListRequest,
+  CatalogListResult,
+  CatalogRefreshRequest,
   ConnectionMenuAction,
   ConnectionProfileInput,
   ConnectionTestRequest,
@@ -10,7 +16,6 @@ import type {
   ExecuteRequest,
   FetchMoreRequest,
   FileCommand,
-  MetadataSnapshot,
   NewDocumentMenuResult,
   OpenedSqlFile,
   OpenSqlFilesRequest,
@@ -24,8 +29,12 @@ import type {
   SaveSqlFileResult,
   SessionRequest,
   SessionState,
+  SetSessionSchemaRequest,
   SQLExplorerApi,
+  SqlCompletionRequest,
+  SqlCompletionResult,
   TransactionRequest,
+  UiSettings,
   WorkspaceSnapshot,
 } from '../shared/contracts';
 import { IPC_CHANNELS } from '../shared/contracts';
@@ -46,6 +55,14 @@ async function invokeDatabase<T>(channel: string, ...args: unknown[]): Promise<T
 const api: SQLExplorerApi = {
   bootstrap: () => ipcRenderer.invoke(IPC_CHANNELS.bootstrap) as Promise<BootstrapPayload>,
   cancel: (executionId: string) => invokeDatabase<boolean>(IPC_CHANNELS.cancel, executionId),
+  catalogComplete: (request: SqlCompletionRequest) =>
+    invokeDatabase<SqlCompletionResult>(IPC_CHANNELS.catalogComplete, request),
+  catalogContext: (request: CatalogContextRequest) =>
+    invokeDatabase<CatalogAccessContext>(IPC_CHANNELS.catalogContext, request),
+  catalogList: (request: CatalogListRequest) =>
+    invokeDatabase<CatalogListResult>(IPC_CHANNELS.catalogList, request),
+  catalogRefresh: (request: CatalogRefreshRequest) =>
+    invokeDatabase<CatalogConnectionState>(IPC_CHANNELS.catalogRefresh, request),
   chooseDirectory: (defaultPath?: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.chooseDirectory, defaultPath) as Promise<string | undefined>,
   confirmAppClose: (allow: boolean) =>
@@ -73,6 +90,11 @@ const api: SQLExplorerApi = {
     ipcRenderer.on(IPC_CHANNELS.beforeAppClose, wrapped);
     return () => ipcRenderer.removeListener(IPC_CHANNELS.beforeAppClose, wrapped);
   },
+  onCatalogStateChanged(listener: (state: CatalogConnectionState) => void) {
+    const wrapped = (_event: Electron.IpcRendererEvent, state: CatalogConnectionState) => listener(state);
+    ipcRenderer.on(IPC_CHANNELS.catalogStateChanged, wrapped);
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.catalogStateChanged, wrapped);
+  },
   onSessionStateChanged(listener: (state: SessionState) => void) {
     const wrapped = (_event: Electron.IpcRendererEvent, state: SessionState) => listener(state);
     ipcRenderer.on(IPC_CHANNELS.sessionStateChanged, wrapped);
@@ -85,8 +107,6 @@ const api: SQLExplorerApi = {
   openSqlFiles: (request?: OpenSqlFilesRequest) =>
     ipcRenderer.invoke(IPC_CHANNELS.openSqlFiles, request) as Promise<OpenedSqlFile[]>,
   reconnect: (request: SessionRequest) => invokeDatabase<SessionState>(IPC_CHANNELS.reconnect, request),
-  refreshMetadata: (connectionId: string) =>
-    invokeDatabase<MetadataSnapshot>(IPC_CHANNELS.refreshMetadata, connectionId),
   reopenSqlFile: (request: ReopenSqlFileRequest) =>
     ipcRenderer.invoke(IPC_CHANNELS.reopenSqlFile, request) as Promise<OpenedSqlFile>,
   reportMetric: (metric: AppMetric) => ipcRenderer.send(IPC_CHANNELS.reportMetric, metric),
@@ -99,8 +119,12 @@ const api: SQLExplorerApi = {
     ipcRenderer.invoke(IPC_CHANNELS.saveOracleSettings, settings) as Promise<OracleSettings>,
   saveSqlFile: (request: SaveSqlFileRequest) =>
     ipcRenderer.invoke(IPC_CHANNELS.saveSqlFile, request) as Promise<SaveSqlFileResult>,
+  saveUiSettings: (settings: UiSettings) =>
+    ipcRenderer.invoke(IPC_CHANNELS.saveUiSettings, settings) as Promise<UiSettings>,
   saveWorkspace: (snapshot: WorkspaceSnapshot) =>
     ipcRenderer.invoke(IPC_CHANNELS.saveWorkspace, snapshot) as Promise<void>,
+  setSessionSchema: (request: SetSessionSchemaRequest) =>
+    invokeDatabase<CatalogAccessContext>(IPC_CHANNELS.setSessionSchema, request),
   setTitleBarTheme: (theme: 'light' | 'dark') =>
     ipcRenderer.send(IPC_CHANNELS.setTitleBarTheme, theme),
   showConnectionMenu: (connectionId: string) =>

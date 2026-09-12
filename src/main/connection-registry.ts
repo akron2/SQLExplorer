@@ -233,7 +233,6 @@ export class ConnectionRegistry {
     if (!this.#profiles.has(id)) return;
     this.#profiles.delete(id);
     this.#sessionPasswords.delete(id);
-    this.store.deleteMetadata(id);
     this.store.deleteConnectionProfile(id);
   }
 

@@ -2,7 +2,7 @@
 
 Кроссплатформенный настольный SQL-клиент для Oracle и PostgreSQL. Текущая версия включает редактор Monaco, независимые SQL-вкладки и транзакции, управляемые профили соединений, одновременные Oracle Thin/Thick runtime, PostgreSQL, честные состояния сессий, порционные результаты и работу с SQL-файлами разных кодировок.
 
-Проектные решения находятся в [docs/architecture.md](docs/architecture.md), подробный план базовых сценариев — в [docs/core-workflows-development-plan.md](docs/core-workflows-development-plan.md), фактический статус — в [docs/implementation-status.md](docs/implementation-status.md).
+Проектные решения находятся в [docs/architecture.md](docs/architecture.md), подробный план базовых сценариев — в [docs/core-workflows-development-plan.md](docs/core-workflows-development-plan.md), фактический статус — в [docs/implementation-status.md](docs/implementation-status.md), а весь незавершённый объём — в едином [бэклоге](docs/backlog.md).
 
 ## Быстрый запуск на Windows
 
@@ -72,4 +72,6 @@ Windows-сборка создаётся в `out/release/SQLExplorer-win32-x64`. 
 
 ## Текущие границы
 
-Bind-параметры, потоковый просмотр больших LOB/binary, постоянная история запросов и выбранный промышленный движок автодополнения ещё не входят в этот срез. PostgreSQL SSL, Oracle Wallet/TCPS и external authentication также не заявлены. Production-приложение не переносит локальные test fixtures; для разработки упакованной сборки используется `run-packaged.ps1`.
+Единственный актуальный список незавершённых функций, дефектов, проверок и открытых продуктовых решений находится в [docs/backlog.md](docs/backlog.md). Другие документы объясняют архитектуру и историю решений, но не заменяют этот список.
+
+Production-приложение не переносит локальные test fixtures; для разработки упакованной сборки используется `run-packaged.ps1`.

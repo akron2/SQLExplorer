@@ -145,3 +145,22 @@ test('exposes Oracle Thin, Thick, TNS, custom addressing and SYSDBA fields', asy
   await dialog.getByLabel('Адресация Oracle').selectOption('connectString');
   await expect(dialog.getByLabel('Connect string')).toBeVisible();
 });
+
+test('browses catalog schemas, searches objects and switches the current schema', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByTestId('sql-editor')).toBeVisible();
+
+  const schemaRows = page.locator('.schema-row-main');
+  await expect(schemaRows.filter({ hasText: /^SQLX/u })).toBeVisible();
+  await page.locator('.schema-row-main', { hasText: 'PUBLIC' }).click();
+  await expect(page.locator('.object-row-mini', { hasText: 'DUAL' })).toBeVisible();
+
+  await page.locator('.schema-row-main', { hasText: 'SQLX' }).click();
+  await page.getByLabel('Найти объект').fill('EMP');
+  await expect(page.locator('.object-row-mini', { hasText: 'EMPLOYEES' })).toBeVisible();
+  await expect(page.locator('.object-row-mini', { hasText: 'DEMO_PKG' })).toHaveCount(0);
+
+  await page.getByLabel('Найти объект').fill('');
+  await page.getByLabel('Текущая схема').selectOption('SYS');
+  await expect(page.locator('.editor-breadcrumb span').first()).toHaveText('SYS');
+});

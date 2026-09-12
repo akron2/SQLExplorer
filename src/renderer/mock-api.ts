@@ -1,9 +1,17 @@
 import type {
   AppMetric,
   BootstrapPayload,
+  CatalogAccessContext,
+  CatalogColumn,
+  CatalogConnectionState,
+  CatalogContextRequest,
+  CatalogListRequest,
+  CatalogListResult,
+  CatalogObjectKind,
+  CatalogObjectSummary,
+  CatalogRefreshRequest,
   ConnectionProfileInput,
   ExecuteRequest,
-  MetadataSnapshot,
   OpenedSqlFile,
   OracleClientDefinition,
   OracleSettings,
@@ -15,20 +23,27 @@ import type {
   SaveSqlFileRequest,
   SessionRequest,
   SessionState,
+  SetSessionSchemaRequest,
+  SqlCompletionItem,
+  SqlCompletionRequest,
+  SqlCompletionResult,
+  UiSettings,
   WorkspaceSnapshot,
 } from '../shared/contracts';
-import { createDemoWorkspace, defaultConnections, defaultMetadata } from '../shared/defaults';
+import { createDemoWorkspace, defaultConnections, normalizeUiSettings } from '../shared/defaults';
 
 const workspaceKey = 'sqlexplorer.browser.workspace';
 const profilesKey = 'sqlexplorer.browser.profiles';
 const settingsKey = 'sqlexplorer.browser.oracle-settings';
 const clientsKey = 'sqlexplorer.browser.oracle-clients';
+const uiSettingsKey = 'sqlexplorer.browser.ui-settings';
 const cancelled = new Set<string>();
 const sessionStates = new Map<string, SessionState>();
 const sessionListeners = new Set<(state: SessionState) => void>();
 let profiles = loadProfiles();
 let oracleSettings = loadJson<OracleSettings>(settingsKey) ?? { defaultNetConfigDir: '' };
 let oracleClients = loadJson<OracleClientDefinition[]>(clientsKey) ?? [];
+let uiSettings = normalizeUiSettings(loadJson<UiSettings>(uiSettingsKey));
 
 function loadJson<T>(key: string): T | undefined {
   try {
@@ -46,7 +61,7 @@ function loadProfiles(): PublicConnectionProfile[] {
 
 function browserWorkspace(): WorkspaceSnapshot {
   const saved = loadJson<WorkspaceSnapshot>(workspaceKey);
-  return saved?.schemaVersion === 2 ? saved : createDemoWorkspace();
+  return saved?.schemaVersion === 3 ? saved : createDemoWorkspace();
 }
 
 function persistProfiles(): void {
@@ -160,15 +175,239 @@ function openedFromFile(file: File): Promise<OpenedSqlFile> {
   }));
 }
 
+interface DemoCatalog {
+  columns: Record<string, CatalogColumn[]>;
+  objects: Record<string, CatalogObjectSummary[]>;
+  schemas: Array<{ isDefault: boolean; name: string }>;
+}
+
+const demoCatalogs: Record<string, DemoCatalog> = {
+  'oracle-local': {
+    schemas: [
+      { name: 'SQLX', isDefault: true },
+      { name: 'PUBLIC', isDefault: false },
+      { name: 'SYS', isDefault: false },
+    ],
+    objects: {
+      SQLX: [
+        { kind: 'table', schema: 'SQLX', name: 'EMPLOYEES' },
+        { kind: 'table', schema: 'SQLX', name: 'DEPARTMENTS' },
+        { kind: 'view', schema: 'SQLX', name: 'EMPLOYEE_DETAILS' },
+        { kind: 'package', schema: 'SQLX', name: 'DEMO_PKG' },
+        { kind: 'synonym', schema: 'SQLX', name: 'STAFF' },
+        { kind: 'sequence', schema: 'SQLX', name: 'EMPLOYEE_ID_SEQ' },
+      ],
+      PUBLIC: [{ kind: 'synonym', schema: 'PUBLIC', name: 'DUAL' }],
+      SYS: [
+        { kind: 'view', schema: 'SYS', name: 'USER_OBJECTS' },
+        { kind: 'view', schema: 'SYS', name: 'USER_TABLES' },
+      ],
+    },
+    columns: {
+      'SQLX.EMPLOYEES': [
+        { name: 'EMPLOYEE_ID', dataType: 'NUMBER(10)', nullable: false, position: 1 },
+        { name: 'DEPARTMENT_ID', dataType: 'NUMBER(10)', nullable: true, position: 2 },
+        { name: 'FULL_NAME', dataType: 'VARCHAR2(120)', nullable: false, position: 3 },
+        { name: 'SALARY', dataType: 'NUMBER(18,4)', nullable: true, position: 4 },
+        { name: 'HIRED_AT', dataType: 'TIMESTAMP', nullable: true, position: 5 },
+        { name: 'NOTES', dataType: 'CLOB', nullable: true, position: 6 },
+      ],
+      'SQLX.DEPARTMENTS': [
+        { name: 'DEPARTMENT_ID', dataType: 'NUMBER(10)', nullable: false, position: 1 },
+        { name: 'DEPARTMENT_NAME', dataType: 'VARCHAR2(100)', nullable: false, position: 2 },
+      ],
+      'SQLX.EMPLOYEE_DETAILS': [
+        { name: 'EMPLOYEE_ID', dataType: 'NUMBER(10)', nullable: false, position: 1 },
+        { name: 'FULL_NAME', dataType: 'VARCHAR2(120)', nullable: false, position: 2 },
+        { name: 'DEPARTMENT_NAME', dataType: 'VARCHAR2(100)', nullable: true, position: 3 },
+      ],
+    },
+  },
+  'postgres-local': {
+    schemas: [{ name: 'public', isDefault: true }],
+    objects: {
+      public: [
+        { kind: 'table', schema: 'public', name: 'departments' },
+        { kind: 'table', schema: 'public', name: 'employees' },
+        { kind: 'table', schema: 'public', name: 'employee_audit' },
+        { kind: 'view', schema: 'public', name: 'employee_details' },
+      ],
+    },
+    columns: {
+      'public.employees': [
+        { name: 'employee_id', dataType: 'integer', nullable: false, position: 1 },
+        { name: 'department_id', dataType: 'integer', nullable: true, position: 2 },
+        { name: 'full_name', dataType: 'text', nullable: false, position: 3 },
+        { name: 'salary', dataType: 'numeric(18,4)', nullable: true, position: 4 },
+      ],
+    },
+  },
+};
+
+const mockKeywords = [
+  'select', 'from', 'where', 'join', 'left join', 'group by', 'order by', 'having',
+  'insert into', 'update', 'delete from', 'commit', 'rollback', 'begin', 'declare', 'with',
+];
+
+const catalogListeners = new Set<(state: CatalogConnectionState) => void>();
+const documentContexts = new Map<string, CatalogAccessContext>();
+
+function defaultMockContext(connectionId: string): CatalogAccessContext {
+  const profile = profiles.find((candidate) => candidate.id === connectionId);
+  const catalog = demoCatalogs[connectionId];
+  const schema = catalog?.schemas.find((entry) => entry.isDefault)?.name
+    ?? (profile?.kind === 'oracle' ? profile.username.toUpperCase() : 'public');
+  return {
+    connectionId,
+    userName: profile?.username ?? '',
+    currentSchema: schema,
+    searchPath: profile?.kind === 'postgres' ? ['"$user"', 'public'] : [],
+    source: 'default',
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+function mockCatalogState(connectionId: string): CatalogConnectionState {
+  const catalog = demoCatalogs[connectionId];
+  const total = catalog?.schemas.length ?? 0;
+  return {
+    connectionId,
+    phase: catalog ? 'ready' : 'error',
+    error: catalog ? undefined : 'Демо-каталог недоступен',
+    loadedSchemas: catalog ? catalog.schemas.length : 0,
+    totalSchemas: total,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function emitMockCatalogState(connectionId: string): void {
+  const state = mockCatalogState(connectionId);
+  for (const listener of catalogListeners) listener(state);
+}
+
+function mockCatalogList(request: CatalogListRequest): CatalogListResult {
+  const catalog = demoCatalogs[request.connectionId];
+  if (!catalog) return { hasMore: false, objects: [], schemas: [], total: 0 };
+  const search = (request.search ?? '').toLocaleLowerCase();
+  const offset = Math.max(0, request.offset ?? 0);
+  const limit = Math.max(1, Math.min(500, request.limit ?? 200));
+  if (request.kind === 'schemas') {
+    const schemas = catalog.schemas
+      .filter((schema) => !search || schema.name.toLocaleLowerCase().includes(search))
+      .map((schema) => ({
+        name: schema.name,
+        isDefault: schema.isDefault,
+        objectCount: (catalog.objects[schema.name] ?? []).length,
+        loaded: true,
+        stale: false,
+      }));
+    return {
+      schemas: schemas.slice(offset, offset + limit),
+      total: schemas.length,
+      hasMore: offset + limit < schemas.length,
+    };
+  }
+  const schema = request.schema ?? '';
+  const kinds = request.objectKinds?.length ? new Set<CatalogObjectKind>(request.objectKinds) : undefined;
+  const objects = (catalog.objects[schema] ?? [])
+    .filter((object) => (!search || object.name.toLocaleLowerCase().includes(search))
+      && (!kinds || kinds.has(object.kind)));
+  return {
+    objects: objects.slice(offset, offset + limit),
+    total: objects.length,
+    hasMore: offset + limit < objects.length,
+  };
+}
+
+function mockCatalogComplete(request: SqlCompletionRequest): SqlCompletionResult {
+  const text = request.textWindow.slice(0, request.cursorOffset);
+  const tail = /(?:(?:"([^"]*)"|([A-Za-z_][A-Za-z0-9_$#]*))\s*\.\s*)?(?:"([^"]*)"|([A-Za-z_][A-Za-z0-9_$#]*))?$/u.exec(text);
+  const qualifier = tail?.[1] ?? tail?.[2];
+  const prefix = tail?.[3] ?? tail?.[4] ?? '';
+  const replaceStart = request.cursorOffset - prefix.length;
+  const catalog = request.connectionId ? demoCatalogs[request.connectionId] : undefined;
+  const context = request.connectionId
+    ? documentContexts.get(request.documentId) ?? defaultMockContext(request.connectionId)
+    : undefined;
+  const items: SqlCompletionItem[] = [];
+  const lowerPrefix = prefix.toLocaleLowerCase();
+  const add = (item: SqlCompletionItem) => {
+    if (items.length < 200) items.push(item);
+  };
+  if (catalog && context) {
+    const matches = (name: string) => !lowerPrefix || name.toLocaleLowerCase().startsWith(lowerPrefix);
+    if (qualifier) {
+      const lower = qualifier.toLocaleLowerCase();
+      const schema = catalog.schemas.find((entry) => entry.name.toLocaleLowerCase() === lower);
+      const object = Object.values(catalog.objects).flat()
+        .find((entry) => entry.name.toLocaleLowerCase() === lower);
+      if (schema) {
+        for (const entry of (catalog.objects[schema.name] ?? []).filter((value) => matches(value.name))) {
+          add({
+            text: entry.name, kind: entry.kind, replaceStart, replaceEnd: request.cursorOffset,
+            detail: `${entry.kind} · ${entry.schema}`, sortText: `1-${entry.name.toLocaleLowerCase()}`,
+          });
+        }
+      } else if (object) {
+        for (const column of (catalog.columns[`${object.schema}.${object.name}`] ?? []).filter((value) => matches(value.name))) {
+          add({
+            text: column.name, kind: 'column', replaceStart, replaceEnd: request.cursorOffset,
+            detail: `${column.dataType} · ${object.name}`,
+            sortText: `0-${column.position.toString().padStart(5, '0')}-${column.name}`,
+          });
+        }
+      }
+    } else {
+      const seen = new Set<string>();
+      for (const entry of (catalog.objects[context.currentSchema] ?? []).filter((value) => matches(value.name))) {
+        seen.add(entry.name.toLocaleLowerCase());
+        add({
+          text: entry.name, kind: entry.kind, replaceStart, replaceEnd: request.cursorOffset,
+          detail: `${entry.kind} · ${entry.schema}`, sortText: `1-${entry.name.toLocaleLowerCase()}`,
+        });
+      }
+      for (const entry of (catalog.objects.PUBLIC ?? []).filter((value) => matches(value.name))) {
+        if (seen.has(entry.name.toLocaleLowerCase())) continue;
+        add({
+          text: entry.name, kind: entry.kind, replaceStart, replaceEnd: request.cursorOffset,
+          detail: `${entry.kind} · ${entry.schema}`, sortText: `2-${entry.name.toLocaleLowerCase()}`,
+        });
+      }
+    }
+  }
+  for (const keyword of mockKeywords) {
+    if (lowerPrefix && !keyword.startsWith(lowerPrefix)) continue;
+    add({
+      text: keyword, kind: 'keyword', replaceStart, replaceEnd: request.cursorOffset,
+      sortText: `9-${keyword}`,
+    });
+  }
+  return { items, incomplete: false, source: catalog ? 'cache' : 'none' };
+}
+
+function mockSetSessionSchema(request: SetSessionSchemaRequest): CatalogAccessContext {
+  const profile = profiles.find((candidate) => candidate.id === request.connectionId);
+  const context: CatalogAccessContext = {
+    connectionId: request.connectionId,
+    userName: profile?.username ?? '',
+    currentSchema: request.schema,
+    searchPath: profile?.kind === 'postgres' ? [request.schema] : [],
+    source: 'session',
+    fetchedAt: new Date().toISOString(),
+  };
+  documentContexts.set(request.documentId, context);
+  return context;
+}
+
 export const mockApi: SQLExplorerApi = {
   bootstrap(): Promise<BootstrapPayload> {
     return Promise.resolve({
       connections: profiles,
-      metadata: defaultMetadata,
       oracleClients,
       oracleSettings,
       platform: 'browser',
       sessionStates: [...sessionStates.values()],
+      uiSettings,
       version: '0.1.0-browser',
       workspace: browserWorkspace(),
     });
@@ -222,16 +461,39 @@ export const mockApi: SQLExplorerApi = {
     emitSession({ ...state, transactionState: 'clean' });
     return Promise.resolve();
   },
-  async refreshMetadata(connectionId: string): Promise<MetadataSnapshot> {
-    await new Promise<void>((resolve) => window.setTimeout(resolve, 80));
-    const metadata = defaultMetadata.find((snapshot) => snapshot.connectionId === connectionId);
-    if (!metadata) throw new Error('Unknown demo connection');
-    return { ...metadata, fetchedAt: new Date().toISOString(), stale: false };
+  catalogComplete(request: SqlCompletionRequest) {
+    return Promise.resolve(mockCatalogComplete(request));
+  },
+  catalogContext(request: CatalogContextRequest) {
+    const context = documentContexts.get(request.documentId);
+    if (context?.connectionId === request.connectionId) return Promise.resolve(context);
+    if (!demoCatalogs[request.connectionId]) return Promise.reject(new Error('Unknown demo connection'));
+    return Promise.resolve(defaultMockContext(request.connectionId));
+  },
+  catalogList(request: CatalogListRequest) {
+    return Promise.resolve(mockCatalogList(request));
+  },
+  async catalogRefresh(request: CatalogRefreshRequest): Promise<CatalogConnectionState> {
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 60));
+    emitMockCatalogState(request.connectionId);
+    return mockCatalogState(request.connectionId);
+  },
+  setSessionSchema(request: SetSessionSchemaRequest) {
+    return Promise.resolve(mockSetSessionSchema(request));
+  },
+  onCatalogStateChanged(listener) {
+    catalogListeners.add(listener);
+    return () => catalogListeners.delete(listener);
   },
   reportMetric(metric: AppMetric) { console.info('[metric]', metric); },
   saveWorkspace(snapshot: WorkspaceSnapshot) {
     localStorage.setItem(workspaceKey, JSON.stringify(snapshot));
     return Promise.resolve();
+  },
+  saveUiSettings(settings) {
+    uiSettings = normalizeUiSettings(settings);
+    localStorage.setItem(uiSettingsKey, JSON.stringify(uiSettings));
+    return Promise.resolve(uiSettings);
   },
   setTitleBarTheme() {},
   testConnection(request) {
