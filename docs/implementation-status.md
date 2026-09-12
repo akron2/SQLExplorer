@@ -82,11 +82,12 @@ SQLExplorer остаётся Electron/React/TypeScript-приложением с
 | Проверка | Результат |
 |---|---|
 | ESLint + строгий TypeScript | проходит |
-| Модульные тесты | 65 тестов в 9 файлах проходят: каталог, анализатор контекста, completion, workspace, файлы, соединения |
-| Browser E2E | 7 сценариев проходят, включая каталог схем, поиск объектов и смену текущей схемы |
-| Electron E2E | 6 сценариев проходят: живые БД, 100 документов, profile persistence/safeStorage, Windows-1251, close guard и reconnect UI |
+| Модульные тесты | 139 тестов в 12 файлах проходят: каталог, автодополнение, настройки интерфейса, workspace, файлы, соединения |
+| Browser E2E | 8 сценариев проходят, включая каталог схем, поиск объектов, смену текущей схемы и масштаб интерфейса |
+| Electron E2E | 7 сценариев проходят: живые БД, автодополнение объектов, 100 документов, profile persistence/safeStorage, Windows-1251, close guard, reconnect UI и сохранение масштаба между перезапусками |
 | Каталог 200 тыс. объектов | префиксный поиск в SQLite укладывается в бюджет модульного теста (500 мс, фактически миллисекунды) |
 | Автодополнение в Electron | после подключения `Ctrl+Space` показывает объекты схемы (`EMPLOYEES` на живом Oracle) |
+| Быстрый перезапуск | повторный запуск на том же userData не падает с `database is locked` (`PRAGMA busy_timeout = 5000`) |
 | Oracle 21c XE Thin | basic, TNS alias, custom connect string, словари, PUBLIC синонимы, `SYS`, paging, rollback, cancel проходят |
 | Oracle 21c XE Thick / Client 19.32 | basic, TNS alias, custom connect string и запросы проходят |
 | Oracle SYSDBA | Thin и Thick проходят с локальным test secret |
