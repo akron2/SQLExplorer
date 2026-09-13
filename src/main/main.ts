@@ -25,8 +25,18 @@ import type {
   ConnectionTestRequest,
   DatabaseErrorInfo,
   ExecuteRequest,
+  ExcelExportCancelRequest,
+  ExcelExportFinishRequest,
+  ExcelExportRowsRequest,
+  ExcelExportStartRequest,
   FetchMoreRequest,
   FileCommand,
+  LobBudgetDecision,
+  LobBudgetRequest,
+  LobProgress,
+  LobReadRequest,
+  LobSaveRequest,
+  LobSaveResult,
   NewDocumentMenuResult,
   OpenSqlFilesRequest,
   OracleClientInput,
@@ -50,6 +60,7 @@ import { DatabaseRuntimeManager } from './database-runtime-manager';
 import { runDatabaseSelfTest } from './database-self-test';
 import { DatabaseOperationError } from './db-worker-client';
 import { ElectronSecretStorage } from './secret-storage';
+import { ExcelExportService } from './excel-export-service';
 import { SessionContextCache } from './session-context';
 import { SqlFileService } from './sql-file-service';
 import { WorkspaceStore } from './workspace-store';
@@ -60,6 +71,7 @@ if (testUserData) app.setPath('userData', testUserData);
 let catalogLoader: CatalogLoader | undefined;
 let completionService: CompletionService | undefined;
 let databaseRuntime: DatabaseRuntimeManager | undefined;
+let excelExport: ExcelExportService | undefined;
 let sessionContexts: SessionContextCache | undefined;
 let workspaceStore: WorkspaceStore | undefined;
 let connectionRegistry: ConnectionRegistry | undefined;
@@ -84,12 +96,12 @@ function connectionConfigRoot(): string {
 
 function requireServices() {
   if (!databaseRuntime || !workspaceStore || !connectionRegistry || !sqlFileService
-    || !catalogLoader || !completionService || !sessionContexts) {
+    || !catalogLoader || !completionService || !sessionContexts || !excelExport) {
     throw new Error('Application services are not initialized');
   }
   return {
     databaseRuntime, workspaceStore, connectionRegistry, sqlFileService,
-    catalogLoader, completionService, sessionContexts,
+    catalogLoader, completionService, sessionContexts, excelExport,
   };
 }
 
@@ -351,6 +363,29 @@ function registerIpc(): void {
     requireServices().databaseRuntime.fetchMore(request));
   databaseHandle(IPC_CHANNELS.cancel, async (_event, executionId: string) =>
     requireServices().databaseRuntime.cancel(executionId));
+  databaseHandle(IPC_CHANNELS.readLob, async (_event, request: LobReadRequest) =>
+    requireServices().databaseRuntime.readLob(request));
+  databaseHandle(IPC_CHANNELS.saveLob, async (event, request: LobSaveRequest): Promise<LobSaveResult> => {
+    const services = requireServices();
+    const filePath = await services.sqlFileService.chooseLobSavePath(windowFor(event), request.suggestedName);
+    if (!filePath) return { status: 'cancelled' };
+    return services.databaseRuntime.saveLob(request, filePath);
+  });
+  databaseHandle(IPC_CHANNELS.cancelLobSave, async (_event, operationId: string) =>
+    requireServices().databaseRuntime.cancelLobSave(operationId));
+  databaseHandle(IPC_CHANNELS.confirmLobBudget, async (_event, decision: LobBudgetDecision) => {
+    await requireServices().databaseRuntime.confirmLobBudget(decision);
+  });
+  databaseHandle(IPC_CHANNELS.excelStart, async (event, request: ExcelExportStartRequest) =>
+    requireServices().excelExport.start(windowFor(event), request));
+  databaseHandle(IPC_CHANNELS.excelRows, async (_event, request: ExcelExportRowsRequest) => {
+    await requireServices().excelExport.writeRows(request);
+  });
+  databaseHandle(IPC_CHANNELS.excelFinish, async (_event, request: ExcelExportFinishRequest) =>
+    requireServices().excelExport.finish(request));
+  databaseHandle(IPC_CHANNELS.excelCancel, async (_event, request: ExcelExportCancelRequest) => {
+    await requireServices().excelExport.cancel(request);
+  });
   databaseHandle(IPC_CHANNELS.commit, async (_event, request: TransactionRequest) => {
     const services = requireServices();
     await services.databaseRuntime.commit(services.connectionRegistry.sessionProfile(request.connectionId), request);
@@ -598,6 +633,7 @@ void app.whenReady().then(async () => {
   );
   await connectionRegistry.initialize();
   databaseRuntime = new DatabaseRuntimeManager(__dirname);
+  excelExport = new ExcelExportService(databaseRuntime);
   sqlFileService = new SqlFileService(workspaceStore);
   sessionContexts = new SessionContextCache();
   catalogLoader = new CatalogLoader(workspaceStore.catalog, databaseRuntime, (connectionId) =>
@@ -615,6 +651,16 @@ void app.whenReady().then(async () => {
   databaseRuntime.on('session-state', (state: SessionState) => {
     for (const window of BrowserWindow.getAllWindows()) {
       window.webContents.send(IPC_CHANNELS.sessionStateChanged, state);
+    }
+  });
+  databaseRuntime.on('lob-progress', (progress: LobProgress) => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      window.webContents.send(IPC_CHANNELS.lobProgress, progress);
+    }
+  });
+  databaseRuntime.on('lob-budget', (request: LobBudgetRequest) => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      window.webContents.send(IPC_CHANNELS.lobBudget, request);
     }
   });
   registerIpc();
@@ -674,6 +720,8 @@ app.on('before-quit', (event) => {
 
 function shutdownAndQuit(): Promise<void> {
   shutdownPromise ??= (async () => {
+    if (excelExport) await excelExport.close();
+    excelExport = undefined;
     if (databaseRuntime) await databaseRuntime.close();
     databaseRuntime = undefined;
     workspaceStore?.close();

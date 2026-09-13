@@ -13,9 +13,22 @@ import type {
   ConnectionTestRequest,
   ConnectionTestResult,
   DatabaseErrorInfo,
+  ExcelExportCancelRequest,
+  ExcelExportFinishRequest,
+  ExcelExportResult,
+  ExcelExportRowsRequest,
+  ExcelExportStartRequest,
+  ExcelExportStartResult,
   ExecuteRequest,
   FetchMoreRequest,
   FileCommand,
+  LobBudgetDecision,
+  LobBudgetRequest,
+  LobChunkResult,
+  LobProgress,
+  LobReadRequest,
+  LobSaveRequest,
+  LobSaveResult,
   NewDocumentMenuResult,
   OpenedSqlFile,
   OpenSqlFilesRequest,
@@ -55,6 +68,9 @@ async function invokeDatabase<T>(channel: string, ...args: unknown[]): Promise<T
 const api: SQLExplorerApi = {
   bootstrap: () => ipcRenderer.invoke(IPC_CHANNELS.bootstrap) as Promise<BootstrapPayload>,
   cancel: (executionId: string) => invokeDatabase<boolean>(IPC_CHANNELS.cancel, executionId),
+  cancelExcelExport: (request: ExcelExportCancelRequest) =>
+    invokeDatabase<void>(IPC_CHANNELS.excelCancel, request),
+  cancelLobSave: (operationId: string) => invokeDatabase<boolean>(IPC_CHANNELS.cancelLobSave, operationId),
   catalogComplete: (request: SqlCompletionRequest) =>
     invokeDatabase<SqlCompletionResult>(IPC_CHANNELS.catalogComplete, request),
   catalogContext: (request: CatalogContextRequest) =>
@@ -67,6 +83,8 @@ const api: SQLExplorerApi = {
     ipcRenderer.invoke(IPC_CHANNELS.chooseDirectory, defaultPath) as Promise<string | undefined>,
   confirmAppClose: (allow: boolean) =>
     ipcRenderer.invoke(IPC_CHANNELS.confirmAppClose, allow) as Promise<void>,
+  confirmLobBudget: (request: LobBudgetDecision) =>
+    invokeDatabase<void>(IPC_CHANNELS.confirmLobBudget, request),
   commit: (request: TransactionRequest) => invokeDatabase<void>(IPC_CHANNELS.commit, request),
   connect: (request: SessionRequest) => invokeDatabase<SessionState>(IPC_CHANNELS.connect, request),
   deleteConnection: (connectionId: string) =>
@@ -76,6 +94,8 @@ const api: SQLExplorerApi = {
   disconnect: (request: SessionRequest) => invokeDatabase<SessionState>(IPC_CHANNELS.disconnect, request),
   execute: (request: ExecuteRequest) => invokeDatabase<QueryPage>(IPC_CHANNELS.execute, request),
   fetchMore: (request: FetchMoreRequest) => invokeDatabase<QueryPage>(IPC_CHANNELS.fetchMore, request),
+  finishExcelExport: (request: ExcelExportFinishRequest) =>
+    invokeDatabase<ExcelExportResult>(IPC_CHANNELS.excelFinish, request),
   getRecentSqlFiles: () =>
     ipcRenderer.invoke(IPC_CHANNELS.getRecentSqlFiles) as Promise<RecentSqlFile[]>,
   listTnsAliases: (configDir: string) =>
@@ -95,6 +115,16 @@ const api: SQLExplorerApi = {
     ipcRenderer.on(IPC_CHANNELS.catalogStateChanged, wrapped);
     return () => ipcRenderer.removeListener(IPC_CHANNELS.catalogStateChanged, wrapped);
   },
+  onLobBudgetRequest(listener: (request: LobBudgetRequest) => void) {
+    const wrapped = (_event: Electron.IpcRendererEvent, request: LobBudgetRequest) => listener(request);
+    ipcRenderer.on(IPC_CHANNELS.lobBudget, wrapped);
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.lobBudget, wrapped);
+  },
+  onLobProgress(listener: (progress: LobProgress) => void) {
+    const wrapped = (_event: Electron.IpcRendererEvent, progress: LobProgress) => listener(progress);
+    ipcRenderer.on(IPC_CHANNELS.lobProgress, wrapped);
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.lobProgress, wrapped);
+  },
   onSessionStateChanged(listener: (state: SessionState) => void) {
     const wrapped = (_event: Electron.IpcRendererEvent, state: SessionState) => listener(state);
     ipcRenderer.on(IPC_CHANNELS.sessionStateChanged, wrapped);
@@ -109,10 +139,12 @@ const api: SQLExplorerApi = {
   reconnect: (request: SessionRequest) => invokeDatabase<SessionState>(IPC_CHANNELS.reconnect, request),
   reopenSqlFile: (request: ReopenSqlFileRequest) =>
     ipcRenderer.invoke(IPC_CHANNELS.reopenSqlFile, request) as Promise<OpenedSqlFile>,
+  readLob: (request: LobReadRequest) => invokeDatabase<LobChunkResult>(IPC_CHANNELS.readLob, request),
   reportMetric: (metric: AppMetric) => ipcRenderer.send(IPC_CHANNELS.reportMetric, metric),
   rollback: (request: TransactionRequest) => invokeDatabase<void>(IPC_CHANNELS.rollback, request),
   saveConnection: (profile: ConnectionProfileInput) =>
     ipcRenderer.invoke(IPC_CHANNELS.saveConnection, profile),
+  saveLob: (request: LobSaveRequest) => invokeDatabase<LobSaveResult>(IPC_CHANNELS.saveLob, request),
   saveOracleClient: (client: OracleClientInput) =>
     ipcRenderer.invoke(IPC_CHANNELS.saveOracleClient, client) as Promise<OracleClientDefinition>,
   saveOracleSettings: (settings: OracleSettings) =>
@@ -131,8 +163,12 @@ const api: SQLExplorerApi = {
     ipcRenderer.invoke(IPC_CHANNELS.showConnectionMenu, connectionId) as Promise<ConnectionMenuAction | undefined>,
   showNewDocumentMenu: () =>
     ipcRenderer.invoke(IPC_CHANNELS.showNewDocumentMenu) as Promise<NewDocumentMenuResult | undefined>,
+  startExcelExport: (request: ExcelExportStartRequest) =>
+    invokeDatabase<ExcelExportStartResult>(IPC_CHANNELS.excelStart, request),
   testConnection: (request: ConnectionTestRequest) =>
     invokeDatabase<ConnectionTestResult>(IPC_CHANNELS.testConnection, request),
+  writeExcelRows: (request: ExcelExportRowsRequest) =>
+    invokeDatabase<void>(IPC_CHANNELS.excelRows, request),
 };
 
 contextBridge.exposeInMainWorld('sqlExplorer', api);

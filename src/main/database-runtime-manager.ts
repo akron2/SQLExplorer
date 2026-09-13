@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import type {
   CatalogColumn,
   CatalogObjectPage,
@@ -10,6 +11,11 @@ import type {
   DatabaseRuntimeConfiguration,
   ExecuteRequest,
   FetchMoreRequest,
+  LobBudgetDecision,
+  LobChunkResult,
+  LobReadRequest,
+  LobSaveRequest,
+  LobSaveResult,
   QueryPage,
   SessionContextResult,
   SessionRequest,
@@ -45,6 +51,7 @@ export class DatabaseRuntimeManager extends EventEmitter {
   readonly #executionDocument = new Map<string, string>();
   readonly #documentExecution = new Map<string, string>();
   readonly #idleTimers = new Map<string, NodeJS.Timeout>();
+  readonly #lobOperations = new Map<string, string>();
   readonly #profileVersions = new Map<string, number>();
   readonly #sessionStates = new Map<string, SessionState>();
 
@@ -64,6 +71,8 @@ export class DatabaseRuntimeManager extends EventEmitter {
 
   async disconnect(profile: ConnectionProfile, request: SessionRequest): Promise<SessionState> {
     this.#rememberProfile(profile);
+    const executionId = this.#documentExecution.get(request.documentId);
+    if (executionId) this.#forgetExecution(executionId);
     const client = this.#clientForCurrentSession(request.documentId);
     if (client) return client.call<SessionState>('disconnect', { profile, request });
     const state: SessionState = {
@@ -100,7 +109,6 @@ export class DatabaseRuntimeManager extends EventEmitter {
     this.#documentExecution.set(request.documentId, request.executionId);
     try {
       const page = await client.call<QueryPage>('execute', { profile, request });
-      if (!page.hasMore) this.#forgetExecution(request.executionId);
       return page;
     } catch (error) {
       this.#forgetExecution(request.executionId);
@@ -110,9 +118,7 @@ export class DatabaseRuntimeManager extends EventEmitter {
 
   async fetchMore(request: FetchMoreRequest): Promise<QueryPage> {
     const client = this.#clientForExecution(request.executionId);
-    const page = await client.call<QueryPage>('fetchMore', request);
-    if (!page.hasMore) this.#forgetExecution(request.executionId);
-    return page;
+    return client.call<QueryPage>('fetchMore', request);
   }
 
   async cancel(executionId: string): Promise<boolean> {
@@ -121,6 +127,38 @@ export class DatabaseRuntimeManager extends EventEmitter {
       return await client.call<boolean>('cancel', { executionId });
     } finally {
       this.#forgetExecution(executionId);
+    }
+  }
+
+  async readLob(request: LobReadRequest): Promise<LobChunkResult> {
+    const client = this.#clientForExecution(request.executionId);
+    return client.call<LobChunkResult>('readLob', request);
+  }
+
+  async saveLob(request: LobSaveRequest, filePath: string): Promise<LobSaveResult> {
+    const client = this.#clientForExecution(request.executionId);
+    const operationId = randomUUID();
+    this.#lobOperations.set(operationId, client.runtimeKey);
+    try {
+      return await client.call<LobSaveResult>('saveLob', { ...request, filePath, operationId });
+    } finally {
+      this.#lobOperations.delete(operationId);
+    }
+  }
+
+  async cancelLobSave(operationId: string): Promise<boolean> {
+    const runtimeKey = this.#lobOperations.get(operationId);
+    const client = runtimeKey ? this.#clients.get(runtimeKey) : undefined;
+    if (!client) return false;
+    return client.call<boolean>('cancelLobSave', { operationId });
+  }
+
+  async confirmLobBudget(decision: LobBudgetDecision): Promise<void> {
+    try {
+      const client = this.#clientForExecution(decision.executionId);
+      await client.call<void>('confirmLobBudget', decision);
+    } catch {
+      // The execution may already be gone; the worker side resolves by timeout.
     }
   }
 
@@ -235,6 +273,7 @@ export class DatabaseRuntimeManager extends EventEmitter {
     this.#executionRuntime.clear();
     this.#executionDocument.clear();
     this.#documentExecution.clear();
+    this.#lobOperations.clear();
     this.#sessionStates.clear();
     this.#profileVersions.clear();
   }
@@ -290,6 +329,14 @@ export class DatabaseRuntimeManager extends EventEmitter {
   }
 
   #handleWorkerEvent(event: DatabaseWorkerEvent): void {
+    if (event.event === 'lob-progress') {
+      this.emit('lob-progress', event.payload);
+      return;
+    }
+    if (event.event === 'lob-budget') {
+      this.emit('lob-budget', event.payload);
+      return;
+    }
     if (event.event !== 'session-state') return;
     const latestVersion = this.#profileVersions.get(event.payload.connectionId);
     const state = latestVersion !== undefined
@@ -311,6 +358,9 @@ export class DatabaseRuntimeManager extends EventEmitter {
     if (this.#clients.get(runtimeKey) === client) this.#clients.delete(runtimeKey);
     for (const [executionId, key] of this.#executionRuntime) {
       if (key === runtimeKey) this.#forgetExecution(executionId);
+    }
+    for (const [operationId, key] of this.#lobOperations) {
+      if (key === runtimeKey) this.#lobOperations.delete(operationId);
     }
     for (const [documentId, state] of this.#sessionStates) {
       if (state.runtimeKey !== runtimeKey || state.status === 'disconnected') continue;

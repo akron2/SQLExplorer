@@ -11,7 +11,19 @@ import type {
   CatalogObjectSummary,
   CatalogRefreshRequest,
   ConnectionProfileInput,
+  ExcelExportCancelRequest,
+  ExcelExportFinishRequest,
+  ExcelExportRowsRequest,
+  ExcelExportStartRequest,
+  ExcelExportStartResult,
   ExecuteRequest,
+  LobBudgetDecision,
+  LobCellValue,
+  LobChunkResult,
+  LobReadRequest,
+  LobSaveRequest,
+  LobSaveResult,
+  LobSubtype,
   OpenedSqlFile,
   OracleClientDefinition,
   OracleSettings,
@@ -31,6 +43,7 @@ import type {
   WorkspaceSnapshot,
 } from '../shared/contracts';
 import { createDemoWorkspace, defaultConnections, normalizeUiSettings } from '../shared/defaults';
+import { adjustTextChunkEnd } from '../shared/lob';
 
 const workspaceKey = 'sqlexplorer.browser.workspace';
 const profilesKey = 'sqlexplorer.browser.profiles';
@@ -90,17 +103,39 @@ function connectedState(request: SessionRequest): SessionState {
   });
 }
 
+interface DemoLob {
+  data: string;
+  sizeUnit: 'bytes' | 'chars';
+  subtype: LobSubtype;
+}
+
+const demoLobs = new Map<string, DemoLob>();
+
+function demoLobKey(executionId: string, rowIndex: number, columnIndex: number): string {
+  return `${executionId}:${rowIndex}:${columnIndex}`;
+}
+
+function demoClob(executionId: string, rowIndex: number, columnIndex: number): LobCellValue {
+  const data = `Демонстрационный CLOB строки ${rowIndex}.\n`
+    + 'строка данных SQLExplorer '.repeat(1200);
+  demoLobs.set(demoLobKey(executionId, rowIndex, columnIndex), {
+    data, sizeUnit: 'chars', subtype: 'CLOB',
+  });
+  return { kind: 'lob', subtype: 'CLOB', size: data.length, sizeUnit: 'chars', available: true };
+}
+
 function oraclePage(executionId: string): QueryPage {
   const columns: QueryColumn[] = [
     { key: 'column-0', name: 'EMPLOYEE_ID', typeName: 'NUMBER(10)', nullable: false },
     { key: 'column-1', name: 'FULL_NAME', typeName: 'VARCHAR2(120)', nullable: false },
     { key: 'column-2', name: 'DEPARTMENT_NAME', typeName: 'VARCHAR2(100)', nullable: true },
     { key: 'column-3', name: 'SALARY', typeName: 'NUMBER(18,4)', nullable: true },
+    { key: 'column-4', name: 'NOTES', typeName: 'CLOB', nullable: true },
   ];
   const rows: QueryRow[] = [
-    { index: 1, cells: ['1', 'Alex Demo', 'Engineering', '12345.6789'] },
-    { index: 2, cells: ['2', 'Taylor Example', 'Engineering', '9876.5432'] },
-    { index: 3, cells: ['3', 'Sam Sample', 'Analytics', null] },
+    { index: 1, cells: ['1', 'Alex Demo', 'Engineering', '12345.6789', demoClob(executionId, 1, 4)] },
+    { index: 2, cells: ['2', 'Taylor Example', 'Engineering', '9876.5432', demoClob(executionId, 2, 4)] },
+    { index: 3, cells: ['3', 'Sam Sample', 'Analytics', null, null] },
   ];
   return {
     executionId, status: 'ready', columns, rows, hasMore: false, elapsedMs: 84,
@@ -430,6 +465,56 @@ export const mockApi: SQLExplorerApi = {
   cancel(executionId) {
     cancelled.add(executionId);
     return Promise.resolve(true);
+  },
+  cancelLobSave: () => Promise.resolve(false),
+  cancelExcelExport: (_request: ExcelExportCancelRequest) => Promise.resolve(),
+  confirmLobBudget: (_request: LobBudgetDecision) => Promise.resolve(),
+  finishExcelExport: (request: ExcelExportFinishRequest) => Promise.resolve({
+    filePath: 'browser-demo-result.xlsx',
+    lobFiles: 0,
+    rows: request.totalRows,
+    warnings: [],
+  }),
+  startExcelExport: (request: ExcelExportStartRequest): Promise<ExcelExportStartResult> => Promise.resolve({
+    status: 'started',
+    sessionId: crypto.randomUUID(),
+    targetPath: request.suggestedName,
+    lobDirectory: `${request.suggestedName}.lobs`,
+  }),
+  writeExcelRows: (_request: ExcelExportRowsRequest) => Promise.resolve(),
+  onLobBudgetRequest: () => () => undefined,
+  onLobProgress: () => () => undefined,
+  readLob(request: LobReadRequest): Promise<LobChunkResult> {
+    const entry = demoLobs.get(demoLobKey(request.executionId, request.rowIndex, request.columnIndex));
+    if (!entry) return Promise.reject(new Error('Значение больше недоступно'));
+    const end = adjustTextChunkEnd(entry.data, Math.min(entry.data.length, request.offset + Math.max(1, request.length)));
+    const chunk = entry.data.slice(request.offset, end);
+    return Promise.resolve({
+      data: chunk,
+      encoding: 'utf8',
+      eof: request.offset + chunk.length >= entry.data.length,
+      nextOffset: request.offset + chunk.length,
+      offset: request.offset,
+      size: entry.data.length,
+      sizeUnit: entry.sizeUnit,
+      subtype: entry.subtype,
+    });
+  },
+  saveLob(request: LobSaveRequest): Promise<LobSaveResult> {
+    const entry = demoLobs.get(demoLobKey(request.executionId, request.rowIndex, request.columnIndex));
+    if (!entry) return Promise.resolve({ status: 'unavailable' });
+    const blob = new Blob([entry.data], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = window.document.createElement('a');
+    anchor.href = url;
+    anchor.download = request.suggestedName;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    return Promise.resolve({
+      status: 'saved',
+      filePath: request.suggestedName,
+      bytes: new TextEncoder().encode(entry.data).byteLength,
+    });
   },
   connect(request) { return Promise.resolve(connectedState(request)); },
   reconnect(request) {

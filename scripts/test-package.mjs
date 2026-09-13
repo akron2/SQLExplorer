@@ -35,6 +35,9 @@ try {
     ...process.env,
     SQLX_CONFIG_ROOT: projectRoot,
     SQLX_TEST_USER_DATA: testUserData,
+    SQLX_LOB_BUDGET_BYTES: '200000',
+    SQLX_LOB_BUDGET_STEP_BYTES: '100000',
+    SQLX_LOB_BUDGET_TIMEOUT_MS: '15000',
   };
   const { stdout } = await executeFile(executable, ['--smoke-test'], {
     cwd: path.dirname(executable),

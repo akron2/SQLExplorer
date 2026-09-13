@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { _electron as electron, expect, test, type ElectronApplication } from '@playwright/test';
+import * as ExcelJS from 'exceljs';
 import iconv from 'iconv-lite';
 
 const projectRoot = process.cwd();
@@ -38,7 +39,7 @@ test('starts the Electron shell and executes against both live databases', async
       node: process.versions.node,
       version: app.getVersion(),
     }));
-    expect(versions).toMatchObject({ electron: '44.3.0', version: '0.1.6' });
+    expect(versions).toMatchObject({ electron: '44.3.0', version: '0.1.7' });
 
     const editor = page.getByTestId('sql-editor');
     await editor.click();
@@ -47,6 +48,19 @@ test('starts the Electron shell and executes against both live databases', async
     await page.getByRole('button', { name: /Выполнить/u }).click();
     await expect(page.getByText('Alex Demo')).toBeVisible();
     await expect(page.locator('.server-status')).toHaveClass(/connected/u);
+
+    await editor.click();
+    await page.keyboard.press('Control+A');
+    await page.keyboard.insertText('select notes from employees where employee_id = 1');
+    await page.getByRole('button', { name: /Выполнить/u }).click();
+    const lobCell = page.locator('.lob-cell').first();
+    await expect(lobCell).toContainText('CLOB');
+    await lobCell.dblclick();
+    const lobViewer = page.getByRole('dialog', { name: 'Просмотр значения' });
+    await expect(lobViewer).toBeVisible();
+    await expect(lobViewer.locator('.lob-text')).toContainText('Synthetic test data');
+    await lobViewer.getByRole('button', { name: 'Закрыть' }).click();
+    await expect(lobViewer).not.toBeVisible();
 
     await editor.click();
     await page.keyboard.press('Control+A');
@@ -86,6 +100,54 @@ test('starts the Electron shell and executes against both live databases', async
     await closeDialog.getByRole('button', { name: 'Отмена' }).click();
     await expect(page.getByTestId('sql-editor')).toBeVisible();
     await page.screenshot({ path: testInfo.outputPath('electron-workspace.png') });
+  } finally {
+    await stopApplication(application);
+  }
+});
+
+test('exports a live Oracle result with LOB files and hyperlinks', async ({ browserName: _browserName }, testInfo) => {
+  const exportPath = testInfo.outputPath('lob-export.xlsx');
+  const application = await electron.launch({
+    executablePath: path.join(projectRoot, 'node_modules', 'electron', 'dist', 'electron.exe'),
+    args: [projectRoot],
+    cwd: projectRoot,
+    env: {
+      ...process.env,
+      SQLX_TEST_USER_DATA: testInfo.outputPath('user-data'),
+    },
+  });
+
+  try {
+    await application.evaluate(({ dialog }, targetPath) => {
+      dialog.showSaveDialog = () => Promise.resolve({ canceled: false, filePath: targetPath, bookmark: '' });
+    }, exportPath);
+    const page = await application.firstWindow();
+    await expect(page.getByTestId('sql-editor')).toBeVisible();
+    const editor = page.getByTestId('sql-editor');
+    await editor.click();
+    await page.keyboard.press('Control+A');
+    await page.keyboard.insertText('select employee_id, notes from employees where employee_id = 1');
+    await page.getByRole('button', { name: /Выполнить/u }).click();
+    await expect(page.locator('.lob-cell').first()).toBeVisible();
+
+    await page.getByRole('button', { name: 'Excel', exact: true }).click();
+    const exportDialog = page.getByRole('dialog', { name: 'Экспорт в Excel' });
+    await expect(exportDialog).toBeVisible();
+    await exportDialog.getByRole('radio', { name: /Каждый LOB/u }).check();
+    await exportDialog.getByRole('button', { name: 'Экспортировать' }).click();
+    await expect(exportDialog.getByText(/Файл:/u)).toBeVisible({ timeout: 20_000 });
+
+    await expect.poll(() => fs.existsSync(exportPath)).toBe(true);
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.readFile(exportPath);
+    const sheet = workbook.getWorksheet('Результат');
+    expect(sheet?.getCell('A2').value).toBe('1');
+    const linkValue = sheet?.getCell('B2').value as { hyperlink?: string; text?: string };
+    expect(linkValue.text).toContain('CLOB');
+    expect(linkValue.hyperlink).toBe('lob-export.lobs/000001-NOTES.txt');
+    const lobPath = path.join(path.dirname(exportPath), linkValue.hyperlink as string);
+    expect(fs.readFileSync(lobPath, 'utf8')).toBe('Synthetic test data');
+    await exportDialog.getByRole('button', { name: 'Закрыть' }).last().click();
   } finally {
     await stopApplication(application);
   }

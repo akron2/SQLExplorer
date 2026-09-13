@@ -5,6 +5,7 @@ const external = [
   ...builtinModules,
   ...builtinModules.map((moduleName) => `node:${moduleName}`),
   'electron',
+  'exceljs',
   'oracledb',
   'pg',
   'pg-cursor',

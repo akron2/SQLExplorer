@@ -2215,3 +2215,229 @@ legend {
   line-height: 1.7;
   white-space: pre;
 }
+
+.lob-cell {
+  color: var(--accent);
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.lob-cell.is-unavailable {
+  color: var(--text-faint);
+  font-weight: 400;
+  cursor: default;
+}
+
+.cell-menu {
+  position: fixed;
+  z-index: 220;
+  display: flex;
+  min-width: 190px;
+  flex-direction: column;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel-strong);
+  box-shadow: 0 10px 30px rgb(0 0 0 / 22%);
+}
+
+.cell-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text);
+  background: transparent;
+  font-size: var(--font-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.cell-menu button:hover {
+  background: var(--accent-soft);
+}
+
+.cell-menu-note {
+  padding: 7px 9px;
+  color: var(--text-faint);
+  font-size: var(--font-sm);
+}
+
+.lob-viewer {
+  width: min(1040px, calc(100vw - 48px));
+  height: min(720px, calc(100vh - 56px));
+}
+
+.lob-mode-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px 0;
+}
+
+.lob-mode-tabs button {
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-soft);
+  background: transparent;
+  cursor: pointer;
+}
+
+.lob-mode-tabs button.is-active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.lob-mode-tabs select {
+  width: auto;
+  margin-left: auto;
+}
+
+.lob-content {
+  position: relative;
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px;
+  overflow: hidden;
+}
+
+.lob-text {
+  flex: 1;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  color: var(--text);
+  background: var(--app-bg);
+  font-family: var(--font-family-mono);
+  font-size: var(--font-sm);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
+
+.lob-hex {
+  white-space: pre;
+  word-break: normal;
+}
+
+.lob-loading {
+  position: absolute;
+  right: 24px;
+  bottom: 18px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  color: var(--text-soft);
+  background: var(--panel-strong);
+  font-size: var(--font-sm);
+}
+
+.lob-actions {
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.lob-status {
+  color: var(--text-faint);
+  font-size: var(--font-sm);
+}
+
+.lob-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+.excel-export-dialog {
+  width: min(680px, calc(100vw - 48px));
+}
+
+.excel-export-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px;
+  overflow: auto;
+}
+
+.excel-modes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dialog-card .excel-mode,
+.dialog-card .excel-load-all {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 10px;
+  color: var(--text);
+}
+
+.dialog-card .excel-load-all {
+  align-items: center;
+}
+
+.dialog-card .excel-mode input[type="radio"],
+.dialog-card .excel-load-all input[type="checkbox"] {
+  width: auto;
+  min-height: 0;
+  margin: 2px 0 0;
+}
+
+.excel-mode span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.excel-mode small {
+  color: var(--text-soft);
+}
+
+.excel-hint {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: var(--font-sm);
+  line-height: 1.45;
+}
+
+.excel-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-soft);
+}
+
+.excel-result {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--text);
+}
+
+.excel-result p {
+  margin: 0;
+  word-break: break-all;
+}
+
+.excel-result ul {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-soft);
+  font-size: var(--font-sm);
+}

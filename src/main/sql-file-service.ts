@@ -70,6 +70,27 @@ export class SqlFileService {
     return result.canceled ? undefined : result.filePaths[0];
   }
 
+  async chooseLobSavePath(window: BrowserWindow | undefined, suggestedName: string): Promise<string | undefined> {
+    const extension = path.extname(suggestedName).replace(/^\./u, '') || 'bin';
+    const options: Electron.SaveDialogOptions = {
+      title: 'Сохранить значение LOB',
+      defaultPath: suggestedName,
+      filters: [
+        {
+          name: extension === 'txt' ? 'Текстовые файлы' : 'Бинарные файлы',
+          extensions: [extension],
+        },
+        { name: 'Все файлы', extensions: ['*'] },
+      ],
+      properties: ['createDirectory', 'showOverwriteConfirmation'],
+    };
+    const result = window
+      ? await dialog.showSaveDialog(window, options)
+      : await dialog.showSaveDialog(options);
+    if (result.canceled || !result.filePath) return undefined;
+    return path.resolve(result.filePath);
+  }
+
   async open(window: BrowserWindow | undefined, request: OpenSqlFilesRequest = {}): Promise<OpenedSqlFile[]> {
     let filePaths = request.paths;
     if (!filePaths?.length) {

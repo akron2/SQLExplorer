@@ -1,12 +1,221 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import * as ExcelJS from 'exceljs';
 import type { ConnectionProfile, ExecuteRequest, QueryPage, SessionState } from '../shared/contracts';
+import { isLobCellValue } from '../shared/lob';
 import type { ConnectionRegistry } from './connection-registry';
 import type { DatabaseRuntimeManager } from './database-runtime-manager';
+import { ExcelExportSession } from './excel-export';
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
+}
+
+async function collectLob(
+  runtime: DatabaseRuntimeManager,
+  request: { columnIndex: number; executionId: string; rowIndex: number },
+): Promise<string> {
+  let data = '';
+  let offset = 0;
+  for (let attempt = 0; attempt < 64; attempt += 1) {
+    const chunk = await runtime.readLob({ ...request, offset, length: 65_536 });
+    data += chunk.data;
+    offset = chunk.nextOffset;
+    if (chunk.eof) return data;
+  }
+  throw new Error('LOB chunk loop did not reach the end of the value');
+}
+
+async function collectLobBytes(
+  runtime: DatabaseRuntimeManager,
+  request: { columnIndex: number; executionId: string; rowIndex: number },
+): Promise<Buffer> {
+  const parts: Buffer[] = [];
+  let offset = 0;
+  for (let attempt = 0; attempt < 64; attempt += 1) {
+    const chunk = await runtime.readLob({ ...request, offset, length: 65_536 });
+    parts.push(Buffer.from(chunk.data, 'base64'));
+    offset = chunk.nextOffset;
+    if (chunk.eof) return Buffer.concat(parts);
+  }
+  throw new Error('LOB chunk loop did not reach the end of the value');
+}
+
+async function verifyLobSupport(
+  runtime: DatabaseRuntimeManager,
+  oracle: ConnectionProfile,
+  postgres: ConnectionProfile,
+): Promise<void> {
+  const oracleDocument = 'integration-oracle-lob';
+  const postgresDocument = 'integration-postgres-lob';
+  const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sqlexplorer-lob-'));
+
+  await execute(runtime, oracle, oracleDocument, `begin
+    execute immediate 'drop table sqlx_lob_probe purge';
+  exception when others then null;
+  end;`);
+  await execute(runtime, oracle, oracleDocument, 'create table sqlx_lob_probe (id number(10) primary key, c clob, b blob)');
+  await execute(runtime, oracle, oracleDocument, `declare
+    l_text varchar2(32000) := rpad('SQLExplorer LOB ', 32000, 'x');
+    l_clob clob;
+    l_blob blob;
+  begin
+    dbms_lob.createtemporary(l_clob, true);
+    dbms_lob.createtemporary(l_blob, true);
+    for i in 1..8 loop
+      dbms_lob.append(l_clob, l_text);
+      dbms_lob.append(l_blob, utl_raw.cast_to_raw(l_text));
+    end loop;
+    insert into sqlx_lob_probe (id, c, b) values (1, l_clob, l_blob);
+    commit;
+  end;`);
+
+  const oraclePage = await execute(runtime, oracle, oracleDocument, 'select id, c, b from sqlx_lob_probe', 10);
+  assert(!oraclePage.hasMore, 'Oracle LOB probe should finish in a single page');
+  const clobCell = oraclePage.rows[0]?.cells[1];
+  const blobCell = oraclePage.rows[0]?.cells[2];
+  assert(isLobCellValue(clobCell) && clobCell.subtype === 'CLOB' && clobCell.size === 256_000,
+    'Oracle CLOB marker is incomplete');
+  assert(isLobCellValue(blobCell) && blobCell.subtype === 'BLOB' && blobCell.size === 256_000,
+    'Oracle BLOB marker is incomplete');
+
+  const firstChunk = await runtime.readLob({
+    executionId: oraclePage.executionId, rowIndex: 1, columnIndex: 1, offset: 0, length: 8_192,
+  });
+  assert(firstChunk.encoding === 'utf8' && firstChunk.data.length === 8_192 && !firstChunk.eof,
+    'Oracle CLOB first chunk is wrong');
+  const secondChunk = await runtime.readLob({
+    executionId: oraclePage.executionId, rowIndex: 1, columnIndex: 1, offset: firstChunk.nextOffset, length: 8_192,
+  });
+  assert(secondChunk.offset === 8_192 && secondChunk.data.length === 8_192,
+    'Oracle CLOB second chunk is wrong');
+
+  const clobText = await collectLob(runtime, { executionId: oraclePage.executionId, rowIndex: 1, columnIndex: 1 });
+  assert(clobText.length === 256_000 && clobText.startsWith('SQLExplorer LOB ') && clobText.endsWith('x'),
+    'Oracle CLOB content is broken after the cursor completed');
+
+  const blobBytes = await collectLobBytes(runtime, { executionId: oraclePage.executionId, rowIndex: 1, columnIndex: 2 });
+  assert(blobBytes.byteLength === 256_000 && blobBytes.subarray(0, 15).toString('utf8') === 'SQLExplorer LOB',
+    'Oracle BLOB content is broken');
+
+  const clobFile = path.join(probeDir, 'oracle-clob.txt');
+  const savedClob = await runtime.saveLob({
+    executionId: oraclePage.executionId, rowIndex: 1, columnIndex: 1, suggestedName: 'oracle-clob.txt',
+  }, clobFile);
+  assert(savedClob.status === 'saved' && savedClob.bytes === 256_000, 'Oracle CLOB save failed');
+  assert(fs.readFileSync(clobFile, 'utf8') === clobText, 'Oracle CLOB file content mismatch');
+
+  const blobFile = path.join(probeDir, 'oracle-blob.bin');
+  const savedBlob = await runtime.saveLob({
+    executionId: oraclePage.executionId, rowIndex: 1, columnIndex: 2, suggestedName: 'oracle-blob.bin',
+  }, blobFile);
+  assert(savedBlob.status === 'saved' && savedBlob.bytes === 256_000, 'Oracle BLOB save failed');
+  assert(fs.readFileSync(blobFile).equals(blobBytes), 'Oracle BLOB file content mismatch');
+  assert((await runtime.cancelLobSave('missing-operation')) === false, 'Unknown LOB save was not reported as missing');
+
+  const exportFile = path.join(probeDir, 'oracle-probe.xlsx');
+  const exportSession = new ExcelExportSession({
+    columns: oraclePage.columns,
+    executionId: oraclePage.executionId,
+    filePath: exportFile,
+    lobDirectory: path.join(probeDir, 'oracle-probe.lobs'),
+    options: { lobMode: 'files' },
+    source: runtime,
+  });
+  await exportSession.writeRows(oraclePage.rows);
+  const exported = await exportSession.finish();
+  assert(exported.rows === 1 && exported.lobFiles === 2, 'Excel export did not write the expected LOB files');
+  const exportedWorkbook = new ExcelJS.Workbook();
+  await exportedWorkbook.xlsx.readFile(exportFile);
+  const exportedSheet = exportedWorkbook.getWorksheet('Результат');
+  const clobLink = exportedSheet?.getCell('B2').value as { hyperlink?: string; text?: string } | undefined;
+  const clobHyperlink = clobLink?.hyperlink;
+  assert(clobHyperlink && clobHyperlink.endsWith('.txt') && clobLink?.text?.includes('CLOB'),
+    'Excel CLOB hyperlink is missing');
+  const exportedLobFile = path.join(probeDir, clobHyperlink);
+  assert(fs.existsSync(exportedLobFile)
+    && fs.statSync(exportedLobFile).size === Buffer.byteLength(clobText, 'utf8'),
+  'Exported CLOB file is broken');
+
+  await execute(runtime, postgres, postgresDocument, 'drop table if exists sqlx_lob_probe');
+  await execute(runtime, postgres, postgresDocument, 'create table sqlx_lob_probe (id integer primary key, c text, b bytea)');
+  await execute(runtime, postgres, postgresDocument,
+    "insert into sqlx_lob_probe values (1, repeat('PostgreSQL LOB ', 16000), decode(repeat('41', 131072), 'hex'))");
+  await execute(runtime, postgres, postgresDocument, 'commit');
+
+  const budgetRequests: string[] = [];
+  const budgetListener = (request: { executionId: string; requestId: string }) => {
+    budgetRequests.push(request.requestId);
+    void runtime.confirmLobBudget({
+      requestId: request.requestId,
+      executionId: request.executionId,
+      allow: budgetRequests.length === 1,
+    });
+  };
+  runtime.on('lob-budget', budgetListener);
+
+  const postgresPage = await execute(runtime, postgres, postgresDocument, 'select id, c, b from sqlx_lob_probe', 10);
+  assert(!postgresPage.hasMore, 'PostgreSQL LOB probe should finish in a single page');
+  const textCell = postgresPage.rows[0]?.cells[1];
+  const byteaCell = postgresPage.rows[0]?.cells[2];
+  assert(isLobCellValue(textCell) && textCell.subtype === 'TEXT' && textCell.size === 240_000 && textCell.available,
+    'PostgreSQL text marker is incomplete');
+  assert(isLobCellValue(byteaCell) && byteaCell.subtype === 'BYTEA' && byteaCell.size === 131_072,
+    'PostgreSQL bytea marker is incomplete');
+  assert(isLobCellValue(byteaCell) && !byteaCell.available && byteaCell.note === 'budget',
+    'PostgreSQL bytea did not respect the declined budget');
+  assert(budgetRequests.length === 2, 'PostgreSQL budget requests were not raised');
+  runtime.off('lob-budget', budgetListener);
+
+  const pgText = await collectLob(runtime, { executionId: postgresPage.executionId, rowIndex: 1, columnIndex: 1 });
+  assert(pgText === 'PostgreSQL LOB '.repeat(16_000), 'PostgreSQL text content is broken');
+
+  let budgetRejected = false;
+  try {
+    await runtime.readLob({ executionId: postgresPage.executionId, rowIndex: 1, columnIndex: 2, offset: 0, length: 16 });
+  } catch {
+    budgetRejected = true;
+  }
+  assert(budgetRejected, 'A value declined by the budget still served data');
+
+  const pgFile = path.join(probeDir, 'postgres-text.txt');
+  const pgSaved = await runtime.saveLob({
+    executionId: postgresPage.executionId, rowIndex: 1, columnIndex: 1, suggestedName: 'postgres-text.txt',
+  }, pgFile);
+  assert(pgSaved.status === 'saved' && pgSaved.bytes === Buffer.byteLength(pgText, 'utf8'),
+    'PostgreSQL text save failed');
+  assert(fs.readFileSync(pgFile, 'utf8') === pgText, 'PostgreSQL text file content mismatch');
+
+  const pgByteaFile = path.join(probeDir, 'postgres-bytea.bin');
+  const pgByteaSaved = await runtime.saveLob({
+    executionId: postgresPage.executionId, rowIndex: 1, columnIndex: 2, suggestedName: 'postgres-bytea.bin',
+  }, pgByteaFile);
+  assert(pgByteaSaved.status === 'unavailable', 'A value declined by the budget was saved');
+
+  await execute(runtime, oracle, oracleDocument, 'select 1 from dual', 1);
+  let staleOracleRejected = false;
+  try {
+    await runtime.readLob({ executionId: oraclePage.executionId, rowIndex: 1, columnIndex: 1, offset: 0, length: 16 });
+  } catch {
+    staleOracleRejected = true;
+  }
+  assert(staleOracleRejected, 'A replaced Oracle execution still served LOB values');
+
+  await execute(runtime, postgres, postgresDocument, 'select 1', 1);
+  let stalePostgresRejected = false;
+  try {
+    await runtime.readLob({ executionId: postgresPage.executionId, rowIndex: 1, columnIndex: 1, offset: 0, length: 16 });
+  } catch {
+    stalePostgresRejected = true;
+  }
+  assert(stalePostgresRejected, 'A replaced PostgreSQL execution still served LOB values');
+
+  await execute(runtime, oracle, oracleDocument, 'drop table sqlx_lob_probe purge');
+  await execute(runtime, postgres, postgresDocument, 'drop table if exists sqlx_lob_probe');
+  await execute(runtime, postgres, postgresDocument, 'commit');
+  fs.rmSync(probeDir, { recursive: true, force: true });
 }
 
 async function execute(
@@ -286,8 +495,9 @@ export async function runDatabaseSelfTest(
     }
   }
 
+  await verifyLobSupport(runtime, oracle, postgres);
   await verifyCancellation(runtime, oracle, oracleDocument, 'begin dbms_session.sleep(5); end;');
   await verifyCancellation(runtime, postgres, postgresDocument, 'select pg_sleep(5)');
 
-  console.log(`DATABASE_SELF_TEST_OK oracle=${oracleConnection.serverVersion} postgres=${postgresConnection.serverVersion} thick=${thick} thickKeys=${thickRuntimeKeys} sysdba=${sysdba} reconnect=passed`);
+  console.log(`DATABASE_SELF_TEST_OK oracle=${oracleConnection.serverVersion} postgres=${postgresConnection.serverVersion} thick=${thick} thickKeys=${thickRuntimeKeys} sysdba=${sysdba} reconnect=passed lob=passed`);
 }

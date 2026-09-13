@@ -1,4 +1,7 @@
+import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import oracledb from 'oracledb';
+import type { Lob as OracleLob } from 'oracledb';
 import pg from 'pg';
 import Cursor from 'pg-cursor';
 import type {
@@ -14,6 +17,15 @@ import type {
   DatabaseRuntimeConfiguration,
   ExecuteRequest,
   FetchMoreRequest,
+  LobBudgetDecision,
+  LobBudgetRequest,
+  LobCellValue,
+  LobChunkResult,
+  LobProgress,
+  LobReadRequest,
+  LobSaveRequest,
+  LobSaveResult,
+  LobSubtype,
   QueryColumn,
   QueryPage,
   QueryRow,
@@ -26,6 +38,15 @@ import type {
   WorkerRequest,
   WorkerResponse,
 } from '../shared/contracts';
+import {
+  LOB_BUDGET_INITIAL_BYTES,
+  LOB_BUDGET_RESPONSE_TIMEOUT_MS,
+  LOB_BUDGET_STEP_BYTES,
+  LOB_INLINE_TEXT_LIMIT,
+  LOB_SAVE_CHUNK_BYTES,
+  adjustTextChunkEnd,
+  isBinarySubtype,
+} from '../shared/lob';
 
 const { Client } = pg;
 const workerPort = process.parentPort;
@@ -82,7 +103,10 @@ type DatabaseSession = OracleSession | PostgresSession;
 
 interface OracleCursorState {
   columns: QueryColumn[];
+  exhausted: boolean;
   kind: 'oracle';
+  lobSubtypes: Array<LobSubtype | undefined>;
+  lobs: LobStore;
   offset: number;
   resultSet: oracledb.ResultSet<unknown[]>;
   sessionKey: string;
@@ -92,7 +116,9 @@ interface OracleCursorState {
 interface PostgresCursorState {
   columns: QueryColumn[];
   cursor: Cursor<Record<string, unknown>>;
+  exhausted: boolean;
   kind: 'postgres';
+  lobs: LobStore;
   offset: number;
   sessionKey: string;
   startedAt: number;
@@ -100,8 +126,146 @@ interface PostgresCursorState {
 
 type CursorState = OracleCursorState | PostgresCursorState;
 
+interface StoredOracleLob {
+  kind: 'oracle';
+  lob: OracleLob;
+  size: number | null;
+  sizeUnit: 'bytes' | 'chars';
+  subtype: LobSubtype;
+}
+
+interface StoredValueLob {
+  data: Buffer | string;
+  kind: 'value';
+  size: number;
+  sizeUnit: 'bytes' | 'chars';
+  subtype: LobSubtype;
+}
+
+type StoredLob = StoredOracleLob | StoredValueLob;
+
+interface LobStore {
+  budgetCap: number;
+  budgetUsed: number;
+  items: Map<string, StoredLob>;
+  pendingBudget: Set<string>;
+}
+
+function createLobStore(): LobStore {
+  return {
+    budgetCap: budgetInitial,
+    budgetUsed: 0,
+    items: new Map(),
+    pendingBudget: new Set(),
+  };
+}
+
+function lobKey(rowIndex: number, columnIndex: number): string {
+  return `${rowIndex}:${columnIndex}`;
+}
+
 const sessions = new Map<string, DatabaseSession>();
 const cursors = new Map<string, CursorState>();
+
+interface BudgetWaiter {
+  resolve(allow: boolean): void;
+  store: LobStore;
+  timer: NodeJS.Timeout;
+}
+
+interface LobSaveTask {
+  cancelled: boolean;
+  executionId: string;
+  filePath: string;
+  operationId: string;
+  stream?: fs.WriteStream;
+}
+
+const budgetWaiters = new Map<string, BudgetWaiter>();
+const lobSaves = new Map<string, LobSaveTask>();
+
+const budgetWaiterTimeoutMs = Number(process.env.SQLX_LOB_BUDGET_TIMEOUT_MS);
+const budgetEnvStep = Number(process.env.SQLX_LOB_BUDGET_STEP_BYTES);
+const budgetEnvInitial = Number(process.env.SQLX_LOB_BUDGET_BYTES);
+const budgetInitial = Number.isFinite(budgetEnvInitial) && budgetEnvInitial >= 0
+  ? budgetEnvInitial
+  : LOB_BUDGET_INITIAL_BYTES;
+const budgetStep = Number.isFinite(budgetEnvStep) && budgetEnvStep >= 0
+  ? budgetEnvStep
+  : LOB_BUDGET_STEP_BYTES;
+
+function emitLobProgress(progress: LobProgress): void {
+  const event: WorkerEvent = { type: 'event', event: 'lob-progress', payload: progress };
+  workerPort.postMessage(event);
+}
+
+async function requestBudget(
+  executionId: string,
+  store: LobStore,
+  requiredBytes: number,
+): Promise<boolean> {
+  const requestId = randomUUID();
+  store.pendingBudget.add(requestId);
+  const request: LobBudgetRequest = {
+    requestId,
+    executionId,
+    requiredBytes,
+    usedBytes: store.budgetUsed,
+    capBytes: store.budgetCap,
+  };
+  const event: WorkerEvent = { type: 'event', event: 'lob-budget', payload: request };
+  workerPort.postMessage(event);
+  const allowed = await new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => {
+      budgetWaiters.delete(requestId);
+      resolve(false);
+    }, Number.isFinite(budgetWaiterTimeoutMs) && budgetWaiterTimeoutMs > 0
+      ? budgetWaiterTimeoutMs
+      : LOB_BUDGET_RESPONSE_TIMEOUT_MS);
+    timer.unref();
+    budgetWaiters.set(requestId, { resolve, store, timer });
+  });
+  store.pendingBudget.delete(requestId);
+  if (allowed) store.budgetCap += budgetStep;
+  return allowed;
+}
+
+function confirmLobBudget(decision: LobBudgetDecision): void {
+  const waiter = budgetWaiters.get(decision.requestId);
+  if (!waiter) return;
+  budgetWaiters.delete(decision.requestId);
+  clearTimeout(waiter.timer);
+  waiter.resolve(decision.allow);
+}
+
+function cancelStoreBudget(store: LobStore): void {
+  for (const requestId of [...store.pendingBudget]) {
+    const waiter = budgetWaiters.get(requestId);
+    store.pendingBudget.delete(requestId);
+    if (!waiter) continue;
+    budgetWaiters.delete(requestId);
+    clearTimeout(waiter.timer);
+    waiter.resolve(false);
+  }
+}
+
+function cancelLobSaveTask(task: LobSaveTask): void {
+  task.cancelled = true;
+  try { task.stream?.destroy(); } catch { /* already closed */ }
+}
+
+function cancelLobSavesForExecution(executionId: string): void {
+  for (const task of [...lobSaves.values()]) {
+    if (task.executionId === executionId) cancelLobSaveTask(task);
+  }
+}
+
+function cancelLobSave(operationId: string): boolean {
+  const task = lobSaves.get(operationId);
+  if (!task) return false;
+  cancelLobSaveTask(task);
+  return true;
+}
 
 function sessionKey(connectionId: string, documentId: string): string {
   return `${connectionId}:${documentId}`;
@@ -181,22 +345,42 @@ function isConnectionError(error: unknown): boolean {
   return databaseError(error).kind === 'connection';
 }
 
-function serializeCell(value: unknown): CellValue {
+function serializePrimitive(value: unknown): CellValue {
   if (value === null || value === undefined) return null;
   if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value;
   if (typeof value === 'bigint') return value.toString();
   if (value instanceof Date) return value.toISOString();
   if (Buffer.isBuffer(value)) return `base64:${value.toString('base64')}`;
   if (value instanceof Uint8Array) return `base64:${Buffer.from(value).toString('base64')}`;
-  if (typeof value === 'object' && value && 'getData' in value) {
-    const typeName = value.constructor?.name || 'LOB';
-    return `<${typeName}: open in value viewer>`;
-  }
   try {
     return JSON.stringify(value);
   } catch {
     return Object.prototype.toString.call(value);
   }
+}
+
+function oracleSubtype(column: oracledb.Metadata<unknown[]>): LobSubtype | undefined {
+  switch (column.dbTypeName) {
+    case 'CLOB': return 'CLOB';
+    case 'NCLOB': return 'NCLOB';
+    case 'BLOB': return 'BLOB';
+    case 'BFILE': return 'BFILE';
+    default: return undefined;
+  }
+}
+
+function isOracleLob(value: unknown): value is OracleLob {
+  return typeof value === 'object' && value !== null
+    && typeof (value as { getData?: unknown }).getData === 'function'
+    && typeof (value as { pipe?: unknown }).pipe === 'function'
+    && typeof (value as { setEncoding?: unknown }).setEncoding === 'function';
+}
+
+function lobSubtypeOf(lob: OracleLob): LobSubtype {
+  if (lob.type === oracledb.CLOB) return 'CLOB';
+  if (lob.type === oracledb.NCLOB) return 'NCLOB';
+  if (lob.type === oracledb.BLOB) return 'BLOB';
+  return 'BFILE';
 }
 
 function oracleColumns(metadata: oracledb.Metadata<unknown[]>[]): QueryColumn[] {
@@ -217,15 +401,108 @@ function postgresColumns(fields: pg.FieldDef[]): QueryColumn[] {
   }));
 }
 
-function arrayRows(rows: unknown[][], offset: number): QueryRow[] {
-  return rows.map((row, rowIndex) => ({ index: offset + rowIndex + 1, cells: row.map(serializeCell) }));
+function oracleRows(
+  rows: unknown[][],
+  subtypes: Array<LobSubtype | undefined>,
+  offset: number,
+  store: LobStore,
+): QueryRow[] {
+  return rows.map((row, rowIndex) => {
+    const rowNumber = offset + rowIndex + 1;
+    return {
+      index: rowNumber,
+      cells: row.map((value, columnIndex) => {
+        if (isOracleLob(value)) {
+          const subtype = subtypes[columnIndex] ?? lobSubtypeOf(value);
+          let size: number | null;
+          try {
+            size = typeof value.length === 'number' ? value.length : null;
+          } catch {
+            size = null;
+          }
+          const sizeUnit = isBinarySubtype(subtype) ? 'bytes' : 'chars';
+          store.items.set(lobKey(rowNumber, columnIndex), { kind: 'oracle', lob: value, subtype, size, sizeUnit });
+          const marker: LobCellValue = { kind: 'lob', subtype, size, sizeUnit, available: true };
+          return marker;
+        }
+        return serializePrimitive(value);
+      }),
+    };
+  });
 }
 
-function objectRows(rows: Record<string, unknown>[], columns: QueryColumn[], offset: number): QueryRow[] {
-  return rows.map((row, rowIndex) => ({
-    index: offset + rowIndex + 1,
-    cells: columns.map((column) => serializeCell(row[column.name])),
-  }));
+async function storeValueCell(
+  store: LobStore,
+  executionId: string,
+  rowIndex: number,
+  columnIndex: number,
+  subtype: LobSubtype,
+  data: Buffer | string,
+  sizeUnit: 'bytes' | 'chars',
+): Promise<LobCellValue> {
+  const bytes = typeof data === 'string' ? Buffer.byteLength(data, 'utf8') : data.byteLength;
+  const size = sizeUnit === 'bytes' ? bytes : data.length;
+  let attempts = 0;
+  while (store.budgetUsed + bytes > store.budgetCap && attempts < 64) {
+    attempts += 1;
+    const allowed = await requestBudget(executionId, store, bytes);
+    if (!allowed) {
+      return { kind: 'lob', subtype, size, sizeUnit, available: false, note: 'budget' };
+    }
+  }
+  if (store.budgetUsed + bytes > store.budgetCap) {
+    return { kind: 'lob', subtype, size, sizeUnit, available: false, note: 'budget' };
+  }
+  store.items.set(lobKey(rowIndex, columnIndex), { kind: 'value', data, subtype, size, sizeUnit });
+  store.budgetUsed += bytes;
+  return { kind: 'lob', subtype, size, sizeUnit, available: true };
+}
+
+async function serializePostgresCell(
+  value: unknown,
+  rowIndex: number,
+  columnIndex: number,
+  store: LobStore,
+  executionId: string,
+): Promise<CellValue> {
+  if (value === null || value === undefined) return null;
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    return storeValueCell(store, executionId, rowIndex, columnIndex, 'BYTEA', Buffer.from(value), 'bytes');
+  }
+  if (typeof value === 'string') {
+    if (value.length <= LOB_INLINE_TEXT_LIMIT) return value;
+    return storeValueCell(store, executionId, rowIndex, columnIndex, 'TEXT', value, 'chars');
+  }
+  const primitive = serializePrimitive(value);
+  if (typeof primitive === 'string' && primitive.length > LOB_INLINE_TEXT_LIMIT) {
+    return storeValueCell(store, executionId, rowIndex, columnIndex, 'TEXT', primitive, 'chars');
+  }
+  return primitive;
+}
+
+async function postgresRows(
+  rows: Record<string, unknown>[],
+  columns: QueryColumn[],
+  offset: number,
+  store: LobStore,
+  executionId: string,
+): Promise<QueryRow[]> {
+  const result: QueryRow[] = [];
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    const cells: CellValue[] = [];
+    const rowNumber = offset + rowIndex + 1;
+    for (let columnIndex = 0; columnIndex < columns.length; columnIndex += 1) {
+      cells.push(await serializePostgresCell(
+        rows[rowIndex][columns[columnIndex].name],
+        rowNumber,
+        columnIndex,
+        store,
+        executionId,
+      ));
+    }
+    result.push({ index: rowNumber, cells });
+  }
+  return result;
 }
 
 function readPostgresCursor<Row extends Record<string, unknown>>(
@@ -312,10 +589,23 @@ async function settleWithin<T>(promise: Promise<T>, timeoutMs: number, message: 
   }
 }
 
+function releaseLobStore(store: LobStore, executionId: string): void {
+  cancelStoreBudget(store);
+  cancelLobSavesForExecution(executionId);
+  const locators = [...store.items.values()]
+    .filter((item): item is StoredOracleLob => item.kind === 'oracle');
+  store.items.clear();
+  store.budgetUsed = 0;
+  for (const item of locators) {
+    try { item.lob.destroy(); } catch { /* already closed */ }
+  }
+}
+
 async function closeCursor(executionId: string, suppressErrors = true): Promise<void> {
   const state = cursors.get(executionId);
   if (!state) return;
   cursors.delete(executionId);
+  releaseLobStore(state.lobs, executionId);
   try {
     const closing = state.kind === 'oracle' ? state.resultSet.close() : state.cursor.close();
     await settleWithin(closing, 3_000, 'Timed out while closing a result cursor');
@@ -482,17 +772,22 @@ async function executeOracle(session: OracleSession, request: ExecuteRequest): P
     session.lastActivityAt = new Date().toISOString();
     if (result.resultSet && result.metaData) {
       const columns = oracleColumns(result.metaData);
-      const rows = await result.resultSet.getRows(size);
-      const hasMore = rows.length === size;
-      if (hasMore) {
+      const lobSubtypes = result.metaData.map((column) => oracleSubtype(column));
+      const values = await result.resultSet.getRows(size);
+      const hasMore = values.length === size;
+      const store = createLobStore();
+      const rows = oracleRows(values, lobSubtypes, 0, store);
+      if (hasMore || store.items.size > 0) {
         cursors.set(request.executionId, {
-          kind: 'oracle', resultSet: result.resultSet, columns, offset: rows.length,
-          sessionKey: session.sessionKey, startedAt,
+          kind: 'oracle', resultSet: result.resultSet, columns, offset: values.length,
+          sessionKey: session.sessionKey, startedAt, lobs: store, exhausted: !hasMore, lobSubtypes,
         });
-      } else await result.resultSet.close();
+      } else {
+        await result.resultSet.close();
+      }
       emitState(stateFor(session, 'connected'));
       return {
-        executionId: request.executionId, status: 'ready', columns, rows: arrayRows(rows, 0), hasMore,
+        executionId: request.executionId, status: 'ready', columns, rows, hasMore,
         elapsedMs: performance.now() - startedAt, message: `${rows.length} rows fetched`,
         transactionState: transactionState(session),
       };
@@ -532,15 +827,19 @@ async function executePostgres(session: PostgresSession, request: ExecuteRequest
   session.activeExecutionId = request.executionId;
   try {
     await ensurePostgresTransaction(session);
-    const values = request.parameters ? Object.values(request.parameters) : [];
-    const cursor = session.client.query(new Cursor<Record<string, unknown>>(ensureSql(request.sql), values));
-    const { rows, result } = await readPostgresCursor(cursor, size);
+    const bindValues = request.parameters ? Object.values(request.parameters) : [];
+    const cursor = session.client.query(new Cursor<Record<string, unknown>>(ensureSql(request.sql), bindValues));
+    const { rows: values, result } = await readPostgresCursor(cursor, size);
     const columns = postgresColumns(result.fields);
-    const hasMore = columns.length > 0 && rows.length === size;
-    if (hasMore) {
+    const hasMore = columns.length > 0 && values.length === size;
+    const store = createLobStore();
+    const rows = columns.length
+      ? await postgresRows(values, columns, 0, store, request.executionId)
+      : [];
+    if (hasMore || store.items.size > 0) {
       cursors.set(request.executionId, {
-        kind: 'postgres', cursor, columns, offset: rows.length,
-        sessionKey: session.sessionKey, startedAt,
+        kind: 'postgres', cursor, columns, offset: values.length,
+        sessionKey: session.sessionKey, startedAt, lobs: store, exhausted: !hasMore,
       });
     } else await cursor.close();
     const command = commandName(request.sql);
@@ -553,7 +852,7 @@ async function executePostgres(session: PostgresSession, request: ExecuteRequest
     const rowsAffected = result.rowCount ?? undefined;
     return {
       executionId: request.executionId, status: 'ready', columns,
-      rows: objectRows(rows, columns, 0), hasMore, rowsAffected,
+      rows, hasMore, rowsAffected,
       elapsedMs: performance.now() - startedAt,
       message: columns.length
         ? `${rows.length} rows fetched`
@@ -589,6 +888,7 @@ async function execute(payload: { profile: ConnectionProfile; request: ExecuteRe
 async function fetchMore(request: FetchMoreRequest): Promise<QueryPage> {
   const state = cursors.get(request.executionId);
   if (!state) throw new Error('The result cursor is no longer available');
+  if (state.exhausted) throw new Error('The result cursor has already been fully fetched');
   const size = pageSize(request.pageSize);
   const session = sessions.get(state.sessionKey);
   if (!session) throw new Error('The database session is no longer available');
@@ -596,10 +896,13 @@ async function fetchMore(request: FetchMoreRequest): Promise<QueryPage> {
   try {
     if (state.kind === 'oracle') {
       const values = await state.resultSet.getRows(size);
-      const rows = arrayRows(values, state.offset);
+      const rows = oracleRows(values, state.lobSubtypes, state.offset, state.lobs);
       state.offset += rows.length;
       const hasMore = rows.length === size;
-      if (!hasMore) await closeCursor(request.executionId);
+      if (!hasMore) {
+        state.exhausted = true;
+        if (state.lobs.items.size === 0) await closeCursor(request.executionId);
+      }
       session.lastActivityAt = new Date().toISOString();
       emitState(stateFor(session, 'connected'));
       return {
@@ -609,10 +912,13 @@ async function fetchMore(request: FetchMoreRequest): Promise<QueryPage> {
       };
     }
     const { rows: values } = await readPostgresCursor(state.cursor, size);
-    const rows = objectRows(values, state.columns, state.offset);
+    const rows = await postgresRows(values, state.columns, state.offset, state.lobs, request.executionId);
     state.offset += rows.length;
     const hasMore = rows.length === size;
-    if (!hasMore) await closeCursor(request.executionId);
+    if (!hasMore) {
+      state.exhausted = true;
+      if (state.lobs.items.size === 0) await closeCursor(request.executionId);
+    }
     session.lastActivityAt = new Date().toISOString();
     emitState(stateFor(session, 'connected'));
     return {
@@ -1164,6 +1470,225 @@ async function setSessionSchema(
   return sessionContext(profile, request);
 }
 
+function readValueLob(item: StoredValueLob, offset: number, length: number): LobChunkResult {
+  if (typeof item.data === 'string') {
+    const end = adjustTextChunkEnd(item.data, Math.min(item.data.length, offset + Math.max(1, length)));
+    const chunk = item.data.slice(offset, end);
+    const nextOffset = offset + chunk.length;
+    return {
+      data: chunk, encoding: 'utf8', eof: nextOffset >= item.data.length,
+      nextOffset, offset, size: item.size, sizeUnit: item.sizeUnit, subtype: item.subtype,
+    };
+  }
+  const end = Math.min(item.data.byteLength, offset + Math.max(1, length));
+  const chunk = item.data.subarray(offset, end);
+  const nextOffset = offset + chunk.byteLength;
+  return {
+    data: chunk.toString('base64'), encoding: 'base64', eof: nextOffset >= item.data.byteLength,
+    nextOffset, offset, size: item.size, sizeUnit: item.sizeUnit, subtype: item.subtype,
+  };
+}
+
+async function readOracleLob(
+  item: StoredOracleLob,
+  offset: number,
+  length: number,
+): Promise<LobChunkResult> {
+  const binary = isBinarySubtype(item.subtype);
+  const amount = Math.max(1, length);
+  const value = await item.lob.getData(offset + 1, amount);
+  if (value === null || value === undefined) {
+    return {
+      data: '', encoding: binary ? 'base64' : 'utf8', eof: true,
+      nextOffset: offset, offset, size: item.size, sizeUnit: item.sizeUnit, subtype: item.subtype,
+    };
+  }
+  if (binary) {
+    const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    const nextOffset = offset + buffer.byteLength;
+    return {
+      data: buffer.toString('base64'), encoding: 'base64',
+      eof: item.size !== null ? nextOffset >= item.size : buffer.byteLength < amount,
+      nextOffset, offset, size: item.size, sizeUnit: item.sizeUnit, subtype: item.subtype,
+    };
+  }
+  let text = typeof value === 'string' ? value : value.toString('utf8');
+  let nextOffset = offset + text.length;
+  let eof = item.size !== null ? nextOffset >= item.size : text.length < amount;
+  const lastCode = text.length ? text.charCodeAt(text.length - 1) : 0;
+  if (!eof && text.length > 0 && lastCode >= 0xd800 && lastCode <= 0xdbff) {
+    const extra = await item.lob.getData(offset + text.length + 1, 1);
+    if (typeof extra === 'string' && extra) {
+      text += extra;
+      nextOffset += extra.length;
+      eof = item.size !== null ? nextOffset >= item.size : false;
+    }
+  }
+  return {
+    data: text, encoding: 'utf8', eof, nextOffset, offset,
+    size: item.size, sizeUnit: item.sizeUnit, subtype: item.subtype,
+  };
+}
+
+async function readLob(request: LobReadRequest): Promise<LobChunkResult> {
+  const state = cursors.get(request.executionId);
+  const item = state?.lobs.items.get(lobKey(request.rowIndex, request.columnIndex));
+  if (!state || !item) {
+    const message = 'Значение больше недоступно: результат запроса заменён или соединение закрыто';
+    throw Object.assign(new Error(message), {
+      databaseError: { kind: 'sql', message, retryable: false } satisfies DatabaseErrorInfo,
+    });
+  }
+  const offset = Math.max(0, Math.trunc(request.offset));
+  const length = Math.max(1, Math.trunc(request.length));
+  return item.kind === 'oracle'
+    ? readOracleLob(item, offset, length)
+    : readValueLob(item, offset, length);
+}
+
+function writeStreamChunk(stream: fs.WriteStream, chunk: Buffer | string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    stream.write(chunk, (error) => (error ? reject(error) : resolve()));
+  });
+}
+
+async function saveOracleLob(
+  task: LobSaveTask,
+  item: StoredOracleLob,
+  meta: { columnIndex: number; rowIndex: number },
+): Promise<LobSaveResult> {
+  const chunkSize = 1024 * 1024;
+  const stream = fs.createWriteStream(task.filePath);
+  task.stream = stream;
+  let offset = 0;
+  let bytes = 0;
+  let error: Error | undefined;
+  try {
+    while (!task.cancelled) {
+      const remaining = item.size === null ? chunkSize : Math.min(chunkSize, item.size - offset);
+      if (remaining <= 0) break;
+      const value = await item.lob.getData(offset + 1, Math.max(1, remaining));
+      if (value === null || value === undefined) break;
+      const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value, 'utf8');
+      if (buffer.byteLength === 0) break;
+      await writeStreamChunk(stream, buffer);
+      bytes = stream.bytesWritten;
+      offset += typeof value === 'string' ? value.length : value.byteLength;
+      emitLobProgress({
+        operationId: task.operationId, executionId: task.executionId,
+        rowIndex: meta.rowIndex, columnIndex: meta.columnIndex,
+        bytesWritten: bytes, totalBytes: item.size, phase: 'running',
+      });
+      const unitLength = typeof value === 'string' ? value.length : value.byteLength;
+      if (unitLength < remaining) break;
+    }
+  } catch (caught) {
+    error = caught instanceof Error ? caught : new Error(String(caught));
+  }
+  if (task.cancelled) {
+    stream.destroy();
+    await fs.promises.rm(task.filePath, { force: true }).catch(() => undefined);
+    emitLobProgress({
+      operationId: task.operationId, executionId: task.executionId,
+      rowIndex: meta.rowIndex, columnIndex: meta.columnIndex,
+      bytesWritten: bytes, totalBytes: item.size, phase: 'cancelled',
+    });
+    return { status: 'cancelled' };
+  }
+  if (error) {
+    stream.destroy();
+    await fs.promises.rm(task.filePath, { force: true }).catch(() => undefined);
+    emitLobProgress({
+      operationId: task.operationId, executionId: task.executionId,
+      rowIndex: meta.rowIndex, columnIndex: meta.columnIndex,
+      bytesWritten: bytes, totalBytes: item.size, phase: 'error', error: error.message,
+    });
+    throw error;
+  }
+  await new Promise<void>((resolve, reject) => {
+    stream.end(() => resolve());
+    stream.once('error', reject);
+  });
+  emitLobProgress({
+    operationId: task.operationId, executionId: task.executionId,
+    rowIndex: meta.rowIndex, columnIndex: meta.columnIndex,
+    bytesWritten: bytes, totalBytes: item.size, phase: 'saved',
+  });
+  return { status: 'saved', filePath: task.filePath, bytes };
+}
+
+async function saveValueLob(
+  task: LobSaveTask,
+  item: StoredValueLob,
+  meta: { columnIndex: number; rowIndex: number },
+): Promise<LobSaveResult> {
+  const { data } = item;
+  const totalBytes = typeof data === 'string' ? Buffer.byteLength(data, 'utf8') : data.byteLength;
+  const stream = fs.createWriteStream(task.filePath);
+  task.stream = stream;
+  const emit = (phase: LobProgress['phase'], error?: string) => emitLobProgress({
+    operationId: task.operationId, executionId: task.executionId,
+    rowIndex: meta.rowIndex, columnIndex: meta.columnIndex,
+    bytesWritten: stream.bytesWritten, totalBytes, phase, error,
+  });
+  try {
+    if (typeof data === 'string') {
+      for (let offset = 0; offset < data.length; offset += LOB_SAVE_CHUNK_BYTES) {
+        if (task.cancelled) break;
+        await writeStreamChunk(stream, data.slice(offset, Math.min(data.length, offset + LOB_SAVE_CHUNK_BYTES)));
+        emit('running');
+      }
+    } else {
+      for (let offset = 0; offset < data.byteLength; offset += LOB_SAVE_CHUNK_BYTES) {
+        if (task.cancelled) break;
+        await writeStreamChunk(stream, data.subarray(offset, Math.min(data.byteLength, offset + LOB_SAVE_CHUNK_BYTES)));
+        emit('running');
+      }
+    }
+    if (task.cancelled) {
+      stream.destroy();
+      await fs.promises.rm(task.filePath, { force: true }).catch(() => undefined);
+      emit('cancelled');
+      return { status: 'cancelled' };
+    }
+    await new Promise<void>((resolve, reject) => {
+      stream.end(() => resolve());
+      stream.once('error', reject);
+    });
+    emit('saved');
+    return { status: 'saved', filePath: task.filePath, bytes: totalBytes };
+  } catch (error) {
+    stream.destroy();
+    await fs.promises.rm(task.filePath, { force: true }).catch(() => undefined);
+    const message = error instanceof Error ? error.message : String(error);
+    emit('error', message);
+    throw error instanceof Error ? error : new Error(message);
+  }
+}
+
+async function saveLob(
+  payload: LobSaveRequest & { filePath: string; operationId: string },
+): Promise<LobSaveResult> {
+  const state = cursors.get(payload.executionId);
+  const item = state?.lobs.items.get(lobKey(payload.rowIndex, payload.columnIndex));
+  if (!state || !item) return { status: 'unavailable' };
+  const task: LobSaveTask = {
+    cancelled: false,
+    executionId: payload.executionId,
+    filePath: payload.filePath,
+    operationId: payload.operationId,
+  };
+  lobSaves.set(task.operationId, task);
+  const meta = { columnIndex: payload.columnIndex, rowIndex: payload.rowIndex };
+  try {
+    return item.kind === 'oracle'
+      ? await saveOracleLob(task, item, meta)
+      : await saveValueLob(task, item, meta);
+  } finally {
+    lobSaves.delete(task.operationId);
+  }
+}
+
 async function closeAll(): Promise<void> {
   await Promise.all([...cursors.keys()].map((executionId) => closeCursor(executionId)));
   await Promise.all([...sessions.values()].map((session) => closeSession(session, true).catch(() => undefined)));
@@ -1203,6 +1728,13 @@ async function dispatch(request: WorkerRequest): Promise<unknown> {
       return setSessionSchema(payload.profile, payload.request);
     }
     case 'listTnsAliases': return oracledb.getNetworkServiceNames((request.payload as { configDir: string }).configDir);
+    case 'readLob': return readLob(request.payload as LobReadRequest);
+    case 'saveLob': return saveLob(request.payload as LobSaveRequest & { filePath: string; operationId: string });
+    case 'cancelLobSave': return cancelLobSave((request.payload as { operationId: string }).operationId);
+    case 'confirmLobBudget': {
+      confirmLobBudget(request.payload as LobBudgetDecision);
+      return undefined;
+    }
     case 'close': return closeAll();
     default: throw new Error(`Unsupported database worker method: ${String(request.method)}`);
   }

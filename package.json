@@ -1,7 +1,7 @@
 {
   "name": "sqlexplorer",
   "productName": "SQLExplorer",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Cross-platform Oracle and PostgreSQL desktop client",
   "main": ".vite/build/main.js",
   "private": true,
@@ -31,6 +31,7 @@
   "license": "MIT",
   "dependencies": {
     "chardet": "2.2.0",
+    "exceljs": "4.4.0",
     "iconv-lite": "0.7.3",
     "oracledb": "7.0.1",
     "pg": "8.23.0",
@@ -73,6 +74,7 @@
     "oracledb@7.0.1": true
   },
   "overrides": {
-    "dompurify": "3.4.15"
+    "dompurify": "3.4.15",
+    "uuid": "11.1.1"
   }
 }

@@ -1,8 +1,9 @@
-import { useMemo } from 'react';
-import { CheckCircle2, Clipboard, Download, LoaderCircle, TriangleAlert } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { CheckCircle2, Clipboard, Download, FileDown, FileSpreadsheet, LoaderCircle, SquarePen, TriangleAlert } from 'lucide-react';
 import { DataGrid, type Column, type RenderHeaderCellProps } from 'react-data-grid';
 import 'react-data-grid/lib/styles.css';
 import type { CellValue, ExecutionStatus, QueryColumn, QueryRow, TransactionState } from '../../shared/contracts';
+import { isLobCellValue, lobCellLabel } from '../../shared/lob';
 
 export interface DocumentResult {
   columns: QueryColumn[];
@@ -19,15 +20,26 @@ export interface DocumentResult {
 interface ResultPanelProps {
   onCopy(): void;
   onExport(): void;
+  onExportExcel(): void;
   onFetchMore(): void;
+  onOpenLob(rowIndex: number, columnIndex: number): void;
+  onSaveLob(rowIndex: number, columnIndex: number): void;
   result: DocumentResult;
   scale: number;
   theme: 'light' | 'dark';
 }
 
+interface CellMenuState {
+  columnIndex: number;
+  rowIndex: number;
+  x: number;
+  y: number;
+}
+
 function displayCell(value: CellValue): string {
   if (value === null) return 'NULL';
   if (typeof value === 'boolean') return value ? 'true' : 'false';
+  if (isLobCellValue(value)) return lobCellLabel(value);
   return String(value);
 }
 
@@ -41,7 +53,27 @@ function Header({ column }: RenderHeaderCellProps<QueryRow>) {
   );
 }
 
-export function ResultPanel({ onCopy, onExport, onFetchMore, result, scale, theme }: ResultPanelProps) {
+export function ResultPanel({ onCopy, onExport, onExportExcel, onFetchMore, onOpenLob, onSaveLob, result, scale, theme }: ResultPanelProps) {
+  const [menu, setMenu] = useState<CellMenuState>();
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!menu) return;
+    const close = (event: PointerEvent) => {
+      if (menuRef.current?.contains(event.target as Node)) return;
+      setMenu(undefined);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMenu(undefined);
+    };
+    window.addEventListener('pointerdown', close);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('pointerdown', close);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [menu]);
+
   const columns = useMemo<Column<QueryRow>[]>(() => [
     {
       key: '__index',
@@ -62,14 +94,40 @@ export function ResultPanel({ onCopy, onExport, onFetchMore, result, scale, them
       renderHeaderCell: Header,
       renderCell: ({ row }: { row: QueryRow }) => {
         const value = row.cells[index];
+        const openMenu = (event: React.MouseEvent) => {
+          event.preventDefault();
+          setMenu({ rowIndex: row.index, columnIndex: index, x: event.clientX, y: event.clientY });
+        };
+        if (isLobCellValue(value)) {
+          return (
+            <span
+              className={`lob-cell${value.available ? '' : ' is-unavailable'}`}
+              title={value.available ? 'Двойной клик — открыть значение' : 'Значение не сохранялось из-за лимита памяти'}
+              onContextMenu={openMenu}
+              onDoubleClick={() => { if (value.available) onOpenLob(row.index, index); }}
+            >
+              {lobCellLabel(value)}
+            </span>
+          );
+        }
         return (
-          <span className={value === null ? 'null-cell' : ''} title={displayCell(value)}>
+          <span
+            className={value === null ? 'null-cell' : ''}
+            title={displayCell(value)}
+            onContextMenu={openMenu}
+          >
             {displayCell(value)}
           </span>
         );
       },
     })),
-  ], [result.columns]);
+  ], [onOpenLob, result.columns]);
+
+  const menuValue = (() => {
+    if (!menu) return undefined;
+    const row = result.rows.find((candidate) => candidate.index === menu.rowIndex);
+    return row?.cells[menu.columnIndex];
+  })();
 
   const loading = ['queued', 'running', 'fetching', 'cancel-requested'].includes(result.status);
 
@@ -87,6 +145,9 @@ export function ResultPanel({ onCopy, onExport, onFetchMore, result, scale, them
           </button>
           <button className="icon-text-button" type="button" onClick={onExport} disabled={!result.rows.length}>
             <Download size={15} /> CSV
+          </button>
+          <button className="icon-text-button" type="button" onClick={onExportExcel} disabled={!result.rows.length || !result.executionId}>
+            <FileSpreadsheet size={15} /> Excel
           </button>
         </div>
       </div>
@@ -135,6 +196,41 @@ export function ResultPanel({ onCopy, onExport, onFetchMore, result, scale, them
           </button>
         )}
       </div>
+      {menu && (
+        <div
+          className="cell-menu"
+          ref={menuRef}
+          role="menu"
+          style={{ left: menu.x, top: menu.y }}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          {isLobCellValue(menuValue) && menuValue.available && (
+            <>
+              <button type="button" role="menuitem" onClick={() => { setMenu(undefined); onOpenLob(menu.rowIndex, menu.columnIndex); }}>
+                <SquarePen size={14} /> Открыть значение
+              </button>
+              <button type="button" role="menuitem" onClick={() => { setMenu(undefined); onSaveLob(menu.rowIndex, menu.columnIndex); }}>
+                <FileDown size={14} /> Сохранить в файл…
+              </button>
+            </>
+          )}
+          {isLobCellValue(menuValue) && !menuValue.available && (
+            <span className="cell-menu-note">Значение не загружено из-за лимита памяти</span>
+          )}
+          {!isLobCellValue(menuValue) && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setMenu(undefined);
+                void navigator.clipboard.writeText(displayCell(menuValue ?? null));
+              }}
+            >
+              <Clipboard size={14} /> Копировать
+            </button>
+          )}
+        </div>
+      )}
     </section>
   );
 }

@@ -8,7 +8,10 @@ import type {
   ConnectionMenuAction,
   ConnectionProfileInput,
   CursorPosition,
+  ExcelExportResult,
   FileCommand,
+  LobBudgetDecision,
+  LobBudgetRequest,
   OpenedSqlFile,
   PublicConnectionProfile,
   QueryPage,
@@ -24,6 +27,7 @@ import type {
   WorkspaceSnapshot,
 } from '../shared/contracts';
 import { createPerformanceWorkspace, normalizeUiSettings } from '../shared/defaults';
+import { isLobCellValue, lobCellLabel, lobSuggestedFileName } from '../shared/lob';
 import { ConnectionDialog } from './components/ConnectionDialog';
 import { AppCloseDialog } from './components/AppCloseDialog';
 import { AppearanceDialog } from './components/AppearanceDialog';
@@ -35,9 +39,12 @@ import {
 } from './components/DecisionDialogs';
 import { DocumentTabs } from './components/DocumentTabs';
 import { EncodingDialog } from './components/EncodingDialog';
+import { ExcelExportDialog, type ExcelExportRequest } from './components/ExcelExportDialog';
 import { ExecutionToolbar } from './components/ExecutionToolbar';
 import { Explorer } from './components/Explorer';
 import { OracleSettingsDialog } from './components/OracleSettingsDialog';
+import { LobBudgetDialog } from './components/LobBudgetDialog';
+import { LobViewerDialog, type LobViewerTarget } from './components/LobViewerDialog';
 import { type DocumentResult, ResultPanel } from './components/ResultPanel';
 import { StatusBar } from './components/StatusBar';
 import { TitleBar } from './components/TitleBar';
@@ -75,6 +82,13 @@ interface FileConflictState {
   documentId: string;
 }
 
+interface ExcelExportState {
+  error?: string;
+  phase: 'done' | 'error' | 'options' | 'working';
+  progress: string;
+  result?: ExcelExportResult;
+}
+
 function resolveTheme(preference: ThemePreference, systemDark: boolean): 'light' | 'dark' {
   if (preference === 'system') return systemDark ? 'dark' : 'light';
   return preference;
@@ -95,7 +109,7 @@ function resultFromPage(page: QueryPage, previous?: DocumentResult): DocumentRes
 
 function csvValue(value: CellValue): string {
   if (value === null) return '';
-  const text = String(value);
+  const text = isLobCellValue(value) ? lobCellLabel(value) : String(value);
   return /[",\r\n]/u.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 
@@ -143,6 +157,11 @@ export function App() {
   const [appClosePhase, setAppClosePhase] = useState<'transactions' | 'files'>();
   const [pendingSessionAction, setPendingSessionAction] = useState<'disconnect' | 'reconnect'>();
   const [fileComparison, setFileComparison] = useState<{ diskText: string; documentId: string }>();
+  const [lobTarget, setLobTarget] = useState<LobViewerTarget>();
+  const [budgetRequests, setBudgetRequests] = useState<LobBudgetRequest[]>([]);
+  const [excelState, setExcelState] = useState<ExcelExportState>();
+  const excelAbortRef = useRef(false);
+  const excelSessionRef = useRef<string | undefined>(undefined);
   const performanceMode = useMemo(() => new URLSearchParams(location.search).get('performance') === '1', []);
   const currentDocumentRef = useRef<SqlDocument | undefined>(undefined);
   currentDocumentRef.current = workspace ? activeDocument(workspace) : undefined;
@@ -214,6 +233,10 @@ export function App() {
       if (!result) return current;
       return { ...current, [state.documentId]: { ...result, transactionState: state.transactionState } };
     });
+  }), [api]);
+
+  useEffect(() => api.onLobBudgetRequest((request) => {
+    setBudgetRequests((current) => [...current, request]);
   }), [api]);
 
   useEffect(() => api.onFileCommand((command) => fileCommandRef.current(command)), [api]);
@@ -819,6 +842,111 @@ export function App() {
     anchor.click();
     URL.revokeObjectURL(url);
   };
+  const openLob = (rowIndex: number, columnIndex: number) => {
+    if (!result.executionId) return;
+    const row = result.rows.find((candidate) => candidate.index === rowIndex);
+    const value = row?.cells[columnIndex];
+    if (!isLobCellValue(value) || !value.available) return;
+    setLobTarget({
+      available: value.available,
+      columnIndex,
+      columnName: result.columns[columnIndex]?.name ?? `column-${columnIndex + 1}`,
+      executionId: result.executionId,
+      rowIndex,
+      size: value.size,
+      sizeUnit: value.sizeUnit,
+      subtype: value.subtype,
+    });
+  };
+  const saveLob = async (rowIndex: number, columnIndex: number) => {
+    if (!result.executionId) return;
+    const row = result.rows.find((candidate) => candidate.index === rowIndex);
+    const value = row?.cells[columnIndex];
+    if (!isLobCellValue(value) || !value.available) return;
+    const columnName = result.columns[columnIndex]?.name ?? `column-${columnIndex + 1}`;
+    try {
+      const saved = await api.saveLob({
+        executionId: result.executionId,
+        rowIndex,
+        columnIndex,
+        suggestedName: lobSuggestedFileName(columnName, rowIndex, value.subtype),
+      });
+      if (saved.status === 'saved') setToast(`Сохранено: ${saved.filePath}`);
+      else if (saved.status === 'unavailable') setToast('Значение больше недоступно');
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : String(error));
+    }
+  };
+  const answerBudget = async (request: LobBudgetRequest, allow: boolean) => {
+    setBudgetRequests((current) => current.filter((candidate) => candidate.requestId !== request.requestId));
+    const decision: LobBudgetDecision = { allow, executionId: request.executionId, requestId: request.requestId };
+    try {
+      await api.confirmLobBudget(decision);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : String(error));
+    }
+  };
+  const exportExcel = async (request: ExcelExportRequest) => {
+    if (!currentDocument || !result.executionId) return;
+    const documentId = currentDocument.id;
+    const executionId = result.executionId;
+    excelAbortRef.current = false;
+    setExcelState({ phase: 'working', progress: 'Подготовка…' });
+    let rows = result.rows;
+    try {
+      if (request.loadAll && result.hasMore) {
+        let hasMore = true;
+        while (hasMore) {
+          if (excelAbortRef.current) throw new Error('cancelled');
+          const page = await api.fetchMore({ executionId, pageSize: 300 });
+          rows = [...rows, ...page.rows];
+          hasMore = page.hasMore;
+          setResults((current) => ({ ...current, [documentId]: resultFromPage(page, current[documentId]) }));
+          setExcelState({ phase: 'working', progress: `Догружено строк: ${rows.length.toLocaleString('ru-RU')}` });
+        }
+      }
+      setExcelState({ phase: 'working', progress: 'Выбор файла…' });
+      const started = await api.startExcelExport({
+        columns: result.columns,
+        executionId,
+        options: request.options,
+        suggestedName: `${currentDocument.title.replace(/\.sql$/iu, '')}-result.xlsx`,
+      });
+      if (started.status === 'cancelled') {
+        setExcelState(undefined);
+        return;
+      }
+      excelSessionRef.current = started.sessionId;
+      const batchSize = 500;
+      for (let index = 0; index < rows.length; index += batchSize) {
+        if (excelAbortRef.current) throw new Error('cancelled');
+        await api.writeExcelRows({ sessionId: started.sessionId, rows: rows.slice(index, index + batchSize) });
+        setExcelState({
+          phase: 'working',
+          progress: `Записано строк: ${Math.min(index + batchSize, rows.length).toLocaleString('ru-RU')} из ${rows.length.toLocaleString('ru-RU')}`,
+        });
+      }
+      const exported = await api.finishExcelExport({ sessionId: started.sessionId, totalRows: rows.length });
+      excelSessionRef.current = undefined;
+      setExcelState({ phase: 'done', progress: '', result: exported });
+    } catch (error) {
+      const sessionId = excelSessionRef.current;
+      excelSessionRef.current = undefined;
+      if (sessionId) await api.cancelExcelExport({ sessionId }).catch(() => undefined);
+      if (excelAbortRef.current) {
+        setExcelState(undefined);
+        return;
+      }
+      setExcelState({ phase: 'error', progress: '', error: error instanceof Error ? error.message : String(error) });
+    }
+  };
+  const cancelExcel = () => {
+    if (excelState?.phase === 'working') {
+      excelAbortRef.current = true;
+      return;
+    }
+    setExcelState(undefined);
+  };
   const resizeResult = (event: React.PointerEvent<HTMLDivElement>) => {
     event.currentTarget.setPointerCapture(event.pointerId);
     const startY = event.clientY;
@@ -911,7 +1039,7 @@ export function App() {
             <div className="editor-footnote">{currentDocument.dialect === 'oracle' ? 'Oracle SQL' : currentDocument.dialect === 'postgres' ? 'PostgreSQL' : 'SQL'} · {currentDocument.encoding.toUpperCase()} · {currentDocument.eol.toUpperCase()}</div>
           </div>
           <div className="result-resizer" onPointerDown={resizeResult} role="separator" aria-orientation="horizontal" />
-          <ResultPanel onCopy={copy} onExport={exportCsv} onFetchMore={() => { void fetchMore(); }} result={result} scale={uiSettings?.interfaceScale ?? 1} theme={resolvedTheme} />
+          <ResultPanel onCopy={copy} onExport={exportCsv} onExportExcel={() => setExcelState({ phase: 'options', progress: '' })} onFetchMore={() => { void fetchMore(); }} onOpenLob={openLob} onSaveLob={(rowIndex, columnIndex) => { void saveLob(rowIndex, columnIndex); }} result={result} scale={uiSettings?.interfaceScale ?? 1} theme={resolvedTheme} />
         </main>
       </div>
       <StatusBar connection={connection} cursor={cursor} document={currentDocument} documentCount={workspace.documents.length} onChangeEol={(eol: TextFileEol) => { if (eol !== currentDocument.eol) setWorkspace(updateDocument(workspace, currentDocument.id, { eol, dirty: true })); }} onOpenEncoding={() => setEncodingDocumentId(currentDocument.id)} session={session} transactionChanged={session?.transactionState === 'changed' || result.transactionState === 'changed'} />
@@ -925,6 +1053,9 @@ export function App() {
       {encodingTarget && <EncodingDialog document={encodingTarget} onClose={() => setEncodingDocumentId(undefined)} onPreview={async (encoding) => encodingTarget.filePath ? (await api.reopenSqlFile({ filePath: encodingTarget.filePath, encoding })).text : encodingTarget.text} onApply={(encoding, bom, reopen) => { void applyEncoding(encoding, bom, reopen); }} />}
       {appClosePhase && <AppCloseDialog phase={appClosePhase} transactionCount={appTransactionCount} dirtyCount={appDirtyCount} onCancel={() => { setAppClosePhase(undefined); void api.confirmAppClose(false); }} onCommitAll={() => { void resolveAppTransactions('commit'); }} onRollbackAll={() => { void resolveAppTransactions('rollback'); }} onDiscardFiles={() => { void discardAllAndClose(); }} onSaveAll={() => { void saveAll().then((saved) => { if (saved) void api.confirmAppClose(true); }); }} />}
       {pendingSessionAction && currentDocument.connectionId && <SessionResetDialog action={pendingSessionAction} onCancel={() => setPendingSessionAction(undefined)} onConfirm={() => { const action = pendingSessionAction; setPendingSessionAction(undefined); void api[action]({ connectionId: currentDocument.connectionId as string, documentId: currentDocument.id, force: true }).catch((error: unknown) => setToast(error instanceof Error ? error.message : String(error))); }} />}
+      {lobTarget && <LobViewerDialog cell={lobTarget} onClose={() => setLobTarget(undefined)} />}
+      {excelState && <ExcelExportDialog hasMore={result.hasMore} loadedRows={result.rows.length} error={excelState.error} onCancel={cancelExcel} onConfirm={(request) => { void exportExcel(request); }} phase={excelState.phase} progress={excelState.progress} result={excelState.result} />}
+      {budgetRequests[0] && <LobBudgetDialog request={budgetRequests[0]} onAllow={() => { void answerBudget(budgetRequests[0], true); }} onDecline={() => { void answerBudget(budgetRequests[0], false); }} />}
       {toast && <button className="toast" type="button" onClick={() => setToast(undefined)}>{toast}</button>}
     </div>
   );
