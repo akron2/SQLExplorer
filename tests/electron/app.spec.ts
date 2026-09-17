@@ -39,7 +39,7 @@ test('starts the Electron shell and executes against both live databases', async
       node: process.versions.node,
       version: app.getVersion(),
     }));
-    expect(versions).toMatchObject({ electron: '44.3.0', version: '0.1.7' });
+    expect(versions).toMatchObject({ electron: '44.3.0', version: '0.1.8' });
 
     const editor = page.getByTestId('sql-editor');
     await editor.click();
@@ -100,6 +100,68 @@ test('starts the Electron shell and executes against both live databases', async
     await closeDialog.getByRole('button', { name: 'Отмена' }).click();
     await expect(page.getByTestId('sql-editor')).toBeVisible();
     await page.screenshot({ path: testInfo.outputPath('electron-workspace.png') });
+  } finally {
+    await stopApplication(application);
+  }
+});
+
+test('prompts for bind values, validates them and reuses them for re-runs', async ({ browserName: _browserName }, testInfo) => {
+  const application = await electron.launch({
+    executablePath: path.join(projectRoot, 'node_modules', 'electron', 'dist', 'electron.exe'),
+    args: [projectRoot],
+    cwd: projectRoot,
+    env: { ...process.env, SQLX_TEST_USER_DATA: testInfo.outputPath('user-data') },
+  });
+
+  try {
+    const page = await application.firstWindow();
+    await expect(page.getByTestId('sql-editor')).toBeVisible();
+    const editor = page.getByTestId('sql-editor');
+    const bindDialog = page.getByRole('dialog', { name: 'Параметры запроса' });
+
+    await editor.click();
+    await page.keyboard.press('Control+A');
+    await page.keyboard.insertText('select full_name from employees where employee_id = :id');
+    await page.getByRole('button', { name: /Выполнить/u }).click();
+    await expect(bindDialog).toBeVisible();
+    await expect(bindDialog.locator('.bind-name')).toHaveText('ID');
+
+    await bindDialog.getByRole('button', { name: 'Отмена' }).click();
+    await expect(bindDialog).not.toBeVisible();
+    await expect(page.locator('.result-status')).not.toContainText('rows fetched');
+
+    await page.getByRole('button', { name: /Выполнить/u }).click();
+    await expect(bindDialog).toBeVisible();
+    await bindDialog.getByLabel('Тип параметра ID').selectOption('number');
+    await bindDialog.getByLabel('Значение параметра ID').fill('abc');
+    await bindDialog.getByRole('button', { name: 'Выполнить' }).click();
+    await expect(bindDialog.locator('.bind-error')).toBeVisible();
+    await expect(bindDialog).toBeVisible();
+
+    await bindDialog.getByLabel('Значение параметра ID').fill('1');
+    await bindDialog.getByRole('button', { name: 'Выполнить' }).click();
+    await expect(page.locator('.rdg')).toContainText('Alex Demo');
+    await expect(bindDialog).not.toBeVisible();
+
+    await page.getByRole('button', { name: /Выполнить/u }).click();
+    await expect(bindDialog).toBeVisible();
+    await expect(bindDialog.getByLabel('Значение параметра ID')).toHaveValue('1');
+    await bindDialog.getByLabel('Значение параметра ID').fill('999');
+    await bindDialog.getByRole('button', { name: 'Выполнить' }).click();
+    await expect(page.locator('.result-status')).toContainText('0 rows');
+
+    await page.getByRole('button', { name: /PostgreSQL local/u }).first().click();
+    await page.getByRole('button', { name: 'Новый SQL-документ' }).click();
+    await editor.click();
+    await page.keyboard.insertText("select tablename from pg_catalog.pg_tables where schemaname = $1 and tablename like :pattern");
+    await page.getByRole('button', { name: /Выполнить/u }).click();
+    await expect(bindDialog).toBeVisible();
+    await expect(bindDialog.locator('.bind-name')).toHaveText(['$1', 'pattern']);
+    await bindDialog.getByLabel('Значение параметра $1').fill('public');
+    await bindDialog.getByLabel('Значение параметра pattern').fill('departments');
+    await bindDialog.getByRole('button', { name: 'Выполнить' }).click();
+    await expect(page.locator('.rdg').getByText('departments')).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath('bind-dialog.png') });
   } finally {
     await stopApplication(application);
   }

@@ -3,7 +3,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import * as ExcelJS from 'exceljs';
-import type { ConnectionProfile, ExecuteRequest, QueryPage, SessionState } from '../shared/contracts';
+import type {
+  BindValue,
+  ConnectionProfile,
+  ExecuteRequest,
+  QueryPage,
+  SessionState,
+} from '../shared/contracts';
 import { isLobCellValue } from '../shared/lob';
 import type { ConnectionRegistry } from './connection-registry';
 import type { DatabaseRuntimeManager } from './database-runtime-manager';
@@ -224,6 +230,7 @@ async function execute(
   documentId: string,
   sql: string,
   pageSize = 2,
+  parameters?: Record<string, BindValue>,
 ): Promise<QueryPage> {
   const request: ExecuteRequest = {
     connectionId: profile.id,
@@ -231,8 +238,152 @@ async function execute(
     executionId: randomUUID(),
     pageSize,
     sql,
+    parameters,
   };
   return runtime.execute(profile, request);
+}
+
+async function verifyBindSupport(
+  runtime: DatabaseRuntimeManager,
+  oracle: ConnectionProfile,
+  postgres: ConnectionProfile,
+): Promise<void> {
+  const oracleDocument = 'integration-oracle-bind';
+  const postgresDocument = 'integration-postgres-bind';
+
+  await execute(runtime, oracle, oracleDocument, `begin
+    execute immediate 'drop table sqlx_bind_probe purge';
+  exception when others then null;
+  end;`);
+  await execute(runtime, oracle, oracleDocument,
+    'create table sqlx_bind_probe (id number(10), name varchar2(64), amount number(12,2), note varchar2(64), created date)');
+  await execute(runtime, oracle, oracleDocument,
+    `insert into sqlx_bind_probe (id, name, amount, note, created)
+     values (:id, :name, :amount, :note, :created)`, 2, {
+      ID: { type: 'number', value: '1' },
+      NAME: { type: 'string', value: 'bind probe' },
+      AMOUNT: { type: 'number', value: '42.5' },
+      NOTE: { type: 'null', value: '' },
+      CREATED: { type: 'date', value: '2026-09-17' },
+    });
+
+  const oracleRow = await execute(runtime, oracle, oracleDocument,
+    `select name, amount, note, to_char(created, 'YYYY-MM-DD') as created from sqlx_bind_probe where id = 1`, 1);
+  assert(oracleRow.rows[0]?.cells[0] === 'bind probe', 'Oracle string bind produced wrong data');
+  assert(oracleRow.rows[0]?.cells[1] === '42.5', 'Oracle number bind produced wrong data');
+  assert(oracleRow.rows[0]?.cells[2] === null, 'Oracle null bind produced wrong data');
+  assert(oracleRow.rows[0]?.cells[3] === '2026-09-17', 'Oracle date bind produced wrong data');
+
+  const oracleDated = await execute(runtime, oracle, oracleDocument,
+    `select to_char(:d, 'YYYY-MM-DD HH24:MI') as value from dual`, 1,
+    { D: { type: 'date', value: '2026-09-17 14:05' } });
+  assert(oracleDated.rows[0]?.cells[0] === '2026-09-17 14:05', 'Oracle date bind ignored the time part');
+
+  const oracleRepeated = await execute(runtime, oracle, oracleDocument,
+    'select :v || :v as doubled from dual', 1, { V: { type: 'string', value: 'ab' } });
+  assert(oracleRepeated.rows[0]?.cells[0] === 'abab', 'Oracle repeated named bind is broken');
+
+  const oracleLower = await execute(runtime, oracle, oracleDocument,
+    'select :x as value from dual', 1, { X: { type: 'number', value: '7' } });
+  assert(oracleLower.rows[0]?.cells[0] === '7', 'Oracle bind names are not case insensitive');
+
+  const oracleRerun = await execute(runtime, oracle, oracleDocument,
+    'select name from sqlx_bind_probe where id = :id', 1, { ID: { type: 'number', value: '999' } });
+  assert(oracleRerun.rows.length === 0, 'Oracle re-run with a new bind value is broken');
+
+  let oracleMissingRejected = false;
+  try {
+    await execute(runtime, oracle, oracleDocument, 'select :missing from dual', 1);
+  } catch (error) {
+    oracleMissingRejected = (error as Error & { kind?: string }).kind === 'bind';
+  }
+  assert(oracleMissingRejected, 'Oracle missing bind value was not reported as a bind error');
+
+  let oracleInvalidRejected = false;
+  try {
+    await execute(runtime, oracle, oracleDocument, 'select :v from dual', 1,
+      { V: { type: 'number', value: 'abc' } });
+  } catch (error) {
+    oracleInvalidRejected = (error as Error & { kind?: string }).kind === 'bind';
+  }
+  assert(oracleInvalidRejected, 'Oracle invalid number bind was not reported as a bind error');
+
+  await execute(runtime, oracle, oracleDocument, 'drop table sqlx_bind_probe purge');
+
+  await execute(runtime, postgres, postgresDocument, 'drop table if exists sqlx_bind_probe');
+  await execute(runtime, postgres, postgresDocument,
+    'create table sqlx_bind_probe (id integer, name text, amount numeric, note text, created date)');
+  await execute(runtime, postgres, postgresDocument,
+    `insert into sqlx_bind_probe (id, name, amount, note, created)
+     values (:id, :name, :amount, :note, :created)`, 2, {
+      id: { type: 'number', value: '1' },
+      name: { type: 'string', value: 'bind probe' },
+      amount: { type: 'number', value: '42.5' },
+      note: { type: 'null', value: '' },
+      created: { type: 'date', value: '2026-09-17' },
+    });
+
+  const postgresRow = await execute(runtime, postgres, postgresDocument,
+    `select name, amount, note, to_char(created, 'YYYY-MM-DD') as created from sqlx_bind_probe where id = 1`, 1);
+  assert(postgresRow.rows[0]?.cells[0] === 'bind probe', 'PostgreSQL string bind produced wrong data');
+  assert(postgresRow.rows[0]?.cells[1] === '42.5', 'PostgreSQL number bind produced wrong data');
+  assert(postgresRow.rows[0]?.cells[2] === null, 'PostgreSQL null bind produced wrong data');
+  assert(postgresRow.rows[0]?.cells[3] === '2026-09-17', 'PostgreSQL date bind produced wrong data');
+
+  const postgresNative = await execute(runtime, postgres, postgresDocument,
+    'select name from sqlx_bind_probe where id = $1 and amount > $2', 1, {
+      '$1': { type: 'number', value: '1' },
+      '$2': { type: 'number', value: '10' },
+    });
+  assert(postgresNative.rows.length === 1, 'PostgreSQL native $n binds are broken');
+
+  const postgresMixed = await execute(runtime, postgres, postgresDocument,
+    'select name from sqlx_bind_probe where id = :id and name = $1', 1, {
+      id: { type: 'number', value: '1' },
+      '$1': { type: 'string', value: 'bind probe' },
+    });
+  assert(postgresMixed.rows.length === 1, 'PostgreSQL mixed named and native binds are broken');
+
+  const postgresRepeated = await execute(runtime, postgres, postgresDocument,
+    'select :v || :v as doubled', 1, { v: { type: 'string', value: 'ab' } });
+  assert(postgresRepeated.rows[0]?.cells[0] === 'abab', 'PostgreSQL repeated named bind is broken');
+
+  const postgresRepeatedNative = await execute(runtime, postgres, postgresDocument,
+    'select $1 || $1 as doubled', 1, { '$1': { type: 'string', value: 'xy' } });
+  assert(postgresRepeatedNative.rows[0]?.cells[0] === 'xyxy', 'PostgreSQL repeated native bind is broken');
+
+  const postgresTyped = await execute(runtime, postgres, postgresDocument,
+    `select to_char($1::date, 'YYYY-MM-DD') as value`, 1, { '$1': { type: 'date', value: '2026-09-17' } });
+  assert(postgresTyped.rows[0]?.cells[0] === '2026-09-17',
+    'PostgreSQL typed date bind is broken');
+
+  const postgresEmpty = await execute(runtime, postgres, postgresDocument,
+    `select :v = '' as value`, 1, { v: { type: 'string', value: '' } });
+  assert(postgresEmpty.rows[0]?.cells[0] === true, 'PostgreSQL empty string bind is broken');
+
+  const postgresRerun = await execute(runtime, postgres, postgresDocument,
+    'select name from sqlx_bind_probe where id = :id', 1, { id: { type: 'number', value: '999' } });
+  assert(postgresRerun.rows.length === 0, 'PostgreSQL re-run with a new bind value is broken');
+
+  let postgresMissingRejected = false;
+  try {
+    await execute(runtime, postgres, postgresDocument, 'select :missing', 1);
+  } catch (error) {
+    postgresMissingRejected = (error as Error & { kind?: string }).kind === 'bind';
+  }
+  assert(postgresMissingRejected, 'PostgreSQL missing bind value was not reported as a bind error');
+
+  let postgresInvalidRejected = false;
+  try {
+    await execute(runtime, postgres, postgresDocument, 'select :v', 1,
+      { v: { type: 'date', value: 'not-a-date' } });
+  } catch (error) {
+    postgresInvalidRejected = (error as Error & { kind?: string }).kind === 'bind';
+  }
+  assert(postgresInvalidRejected, 'PostgreSQL invalid date bind was not reported as a bind error');
+
+  await execute(runtime, postgres, postgresDocument, 'drop table if exists sqlx_bind_probe');
+  await execute(runtime, postgres, postgresDocument, 'commit');
 }
 
 async function verifyCancellation(
@@ -496,8 +647,9 @@ export async function runDatabaseSelfTest(
   }
 
   await verifyLobSupport(runtime, oracle, postgres);
+  await verifyBindSupport(runtime, oracle, postgres);
   await verifyCancellation(runtime, oracle, oracleDocument, 'begin dbms_session.sleep(5); end;');
   await verifyCancellation(runtime, postgres, postgresDocument, 'select pg_sleep(5)');
 
-  console.log(`DATABASE_SELF_TEST_OK oracle=${oracleConnection.serverVersion} postgres=${postgresConnection.serverVersion} thick=${thick} thickKeys=${thickRuntimeKeys} sysdba=${sysdba} reconnect=passed lob=passed`);
+  console.log(`DATABASE_SELF_TEST_OK oracle=${oracleConnection.serverVersion} postgres=${postgresConnection.serverVersion} thick=${thick} thickKeys=${thickRuntimeKeys} sysdba=${sysdba} reconnect=passed lob=passed bind=passed`);
 }

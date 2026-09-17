@@ -1,7 +1,7 @@
 {
   "name": "sqlexplorer",
   "productName": "SQLExplorer",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Cross-platform Oracle and PostgreSQL desktop client",
   "main": ".vite/build/main.js",
   "private": true,

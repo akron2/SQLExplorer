@@ -27,12 +27,20 @@ export type TextFileBom = 'none' | 'utf8' | 'utf16le' | 'utf16be' | 'utf32le' | 
 export type TextFileEol = 'lf' | 'crlf' | 'cr';
 export type DatabaseErrorKind =
   | 'authentication'
+  | 'bind'
   | 'cancelled'
   | 'configuration'
   | 'connection'
   | 'sql'
   | 'transaction'
   | 'unknown';
+
+export type BindValueType = 'string' | 'number' | 'date' | 'null';
+
+export interface BindValue {
+  type: BindValueType;
+  value: string;
+}
 
 export interface CursorPosition {
   column: number;
@@ -365,7 +373,7 @@ export interface ExecuteRequest {
   documentId: string;
   executionId: string;
   pageSize: number;
-  parameters?: Record<string, boolean | number | string | null>;
+  parameters?: Record<string, BindValue>;
   schema?: string;
   sql: string;
 }

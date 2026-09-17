@@ -5,6 +5,7 @@ import type { Lob as OracleLob } from 'oracledb';
 import pg from 'pg';
 import Cursor from 'pg-cursor';
 import type {
+  BindValue,
   CatalogColumn,
   CatalogObjectKind,
   CatalogObjectPage,
@@ -47,6 +48,14 @@ import {
   adjustTextChunkEnd,
   isBinarySubtype,
 } from '../shared/lob';
+import {
+  type BindPrimitive,
+  type SqlParameterOccurrence,
+  extractSqlParameters,
+  parseBindValue,
+  rewritePostgresSql,
+  uniqueSqlParameters,
+} from '../shared/sql-binds';
 
 const { Client } = pg;
 const workerPort = process.parentPort;
@@ -305,6 +314,68 @@ function changesTransaction(sql: string, kind: 'oracle' | 'postgres'): boolean {
     return true;
   }
   return kind === 'postgres' && ['CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'GRANT', 'REVOKE'].includes(command);
+}
+
+function bindError(message: string): Error {
+  return Object.assign(new Error(message), {
+    databaseError: { kind: 'bind', message, retryable: false } satisfies DatabaseErrorInfo,
+  });
+}
+
+function convertBindValues(
+  occurrences: SqlParameterOccurrence[],
+  parameters: Record<string, BindValue> | undefined,
+): Map<string, BindPrimitive> {
+  const provided = parameters ?? {};
+  for (const occurrence of occurrences) {
+    if (!(occurrence.key in provided)) {
+      throw bindError(`Не задано значение параметра ${occurrence.name}`);
+    }
+  }
+  const expected = new Set(occurrences.map((occurrence) => occurrence.key));
+  const extras = Object.keys(provided).filter((key) => !expected.has(key));
+  if (extras.length) {
+    throw bindError(`Неизвестные значения параметров: ${extras.map((key) => `:${key}`).join(', ')}`);
+  }
+  const converted = new Map<string, BindPrimitive>();
+  for (const occurrence of occurrences) {
+    const input = provided[occurrence.key];
+    const parsed = parseBindValue(input.type, input.value);
+    if (!parsed.ok) throw bindError(`${occurrence.name}: ${parsed.message}`);
+    converted.set(occurrence.key, parsed.value);
+  }
+  return converted;
+}
+
+function oracleBinds(
+  sql: string,
+  parameters: Record<string, BindValue> | undefined,
+): Record<string, string | number | Date | null> {
+  const extraction = extractSqlParameters(sql, 'oracle');
+  if (extraction.error) throw bindError(extraction.error);
+  const order = uniqueSqlParameters(extraction.occurrences);
+  const converted = convertBindValues(order, parameters);
+  const binds: Record<string, string | number | Date | null> = {};
+  for (const occurrence of order) {
+    binds[occurrence.key] = converted.get(occurrence.key) ?? null;
+  }
+  return binds;
+}
+
+function postgresBindPlan(
+  sql: string,
+  parameters: Record<string, BindValue> | undefined,
+): { sql: string; values: Array<string | number | null> } {
+  const rewrite = rewritePostgresSql(sql);
+  if ('error' in rewrite) throw bindError(rewrite.error);
+  const converted = convertBindValues(rewrite.order, parameters);
+  const values = rewrite.order.map((occurrence) => {
+    const value = converted.get(occurrence.key);
+    if (value instanceof Date) return (parameters ?? {})[occurrence.key].value.trim();
+    if (value === null || typeof value === 'string' || typeof value === 'number') return value;
+    return String(value);
+  });
+  return { sql: rewrite.sql, values };
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -764,9 +835,10 @@ async function executeOracle(session: OracleSession, request: ExecuteRequest): P
   const startedAt = performance.now();
   session.activeExecutionId = request.executionId;
   try {
+    const binds = oracleBinds(request.sql, request.parameters);
     const result = await session.connection.execute<unknown[]>(
       oracleDriverSql(request.sql),
-      request.parameters ?? {},
+      binds,
       { autoCommit: false, fetchArraySize: size, outFormat: oracledb.OUT_FORMAT_ARRAY, resultSet: true },
     );
     session.lastActivityAt = new Date().toISOString();
@@ -826,9 +898,9 @@ async function executePostgres(session: PostgresSession, request: ExecuteRequest
   const startedAt = performance.now();
   session.activeExecutionId = request.executionId;
   try {
+    const plan = postgresBindPlan(request.sql, request.parameters);
     await ensurePostgresTransaction(session);
-    const bindValues = request.parameters ? Object.values(request.parameters) : [];
-    const cursor = session.client.query(new Cursor<Record<string, unknown>>(ensureSql(request.sql), bindValues));
+    const cursor = session.client.query(new Cursor<Record<string, unknown>>(ensureSql(plan.sql), plan.values));
     const { rows: values, result } = await readPostgresCursor(cursor, size);
     const columns = postgresColumns(result.fields);
     const hasMore = columns.length > 0 && values.length === size;
@@ -862,7 +934,7 @@ async function executePostgres(session: PostgresSession, request: ExecuteRequest
   } catch (error) {
     if (isConnectionError(error)) {
       await invalidateSession(session, error, session.changed || changesTransaction(request.sql, 'postgres'));
-    } else if (session.transactionOpen) {
+    } else if (session.transactionOpen && databaseError(error).kind !== 'bind') {
       session.changed = true;
       emitState(stateFor(session, 'connected', databaseError(error, 'sql')));
     }

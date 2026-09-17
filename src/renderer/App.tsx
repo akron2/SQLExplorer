@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
+  BindValue,
   BootstrapPayload,
   CatalogAccessContext,
   CatalogListRequest,
@@ -28,9 +29,11 @@ import type {
 } from '../shared/contracts';
 import { createPerformanceWorkspace, normalizeUiSettings } from '../shared/defaults';
 import { isLobCellValue, lobCellLabel, lobSuggestedFileName } from '../shared/lob';
+import { extractSqlParameters, uniqueSqlParameters } from '../shared/sql-binds';
 import { ConnectionDialog } from './components/ConnectionDialog';
 import { AppCloseDialog } from './components/AppCloseDialog';
 import { AppearanceDialog } from './components/AppearanceDialog';
+import { BindParametersDialog, type BindDialogParameter } from './components/BindParametersDialog';
 import {
   CloseDocumentDialog,
   FileComparisonDialog,
@@ -158,6 +161,12 @@ export function App() {
   const [pendingSessionAction, setPendingSessionAction] = useState<'disconnect' | 'reconnect'>();
   const [fileComparison, setFileComparison] = useState<{ diskText: string; documentId: string }>();
   const [lobTarget, setLobTarget] = useState<LobViewerTarget>();
+  const [bindDialog, setBindDialog] = useState<{
+    documentId: string;
+    parameters: BindDialogParameter[];
+    sql: string;
+  }>();
+  const lastBindValues = useRef<Record<string, Record<string, BindValue>>>({});
   const [budgetRequests, setBudgetRequests] = useState<LobBudgetRequest[]>([]);
   const [excelState, setExcelState] = useState<ExcelExportState>();
   const excelAbortRef = useRef(false);
@@ -313,7 +322,7 @@ export function App() {
     };
   }, [api, workspace?.documents.length]);
 
-  const connections = bootstrap?.connections ?? [];
+  const connections = useMemo(() => bootstrap?.connections ?? [], [bootstrap]);
   const currentDocument = workspace ? activeDocument(workspace) : undefined;
   const connection = currentDocument?.connectionId
     ? connections.find((candidate) => candidate.id === currentDocument.connectionId)
@@ -414,6 +423,7 @@ export function App() {
   };
 
   const finishClose = async (documentId: string, rememberClosed = true) => {
+    delete lastBindValues.current[documentId];
     if (!workspace) return;
     const document = workspace.documents.find((candidate) => candidate.id === documentId);
     const profile = document?.connectionId
@@ -449,18 +459,11 @@ export function App() {
     await finishClose(document.id, false);
   };
 
-  const execute = useCallback(async () => {
-    if (!workspace || !bootstrap) return;
-    const document = activeDocument(workspace);
-    if (!document.connectionId) {
-      setToast('Выберите соединение для этой вкладки');
-      return;
-    }
-    const sql = editorRef.current?.getSqlToExecute().trim() ?? document.text.trim();
-    if (!sql) {
-      setToast('Нет SQL для выполнения');
-      return;
-    }
+  const runSql = useCallback(async (
+    document: SqlDocument,
+    sql: string,
+    parameters?: Record<string, BindValue>,
+  ) => {
     const executionId = crypto.randomUUID();
     setResults((current) => ({
       ...current,
@@ -471,12 +474,12 @@ export function App() {
     }));
     try {
       const page = await api.execute({
-        connectionId: document.connectionId, documentId: document.id,
-        executionId, pageSize: 300, sql, schema: document.schema,
+        connectionId: document.connectionId as string, documentId: document.id,
+        executionId, pageSize: 300, sql, schema: document.schema, parameters,
       });
       setResults((current) => ({ ...current, [document.id]: resultFromPage(page) }));
       void refreshDocumentContext(document);
-      void loadSchemas(document.connectionId);
+      void loadSchemas(document.connectionId as string);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const kind = error && typeof error === 'object' && 'kind' in error ? String(error.kind) : 'unknown';
@@ -487,11 +490,60 @@ export function App() {
           ...(current[document.id] ?? emptyResult()),
           status: cancelled ? 'cancelled' : 'error',
           error: message,
-          message: cancelled ? 'Выполнение отменено' : kind === 'connection' ? 'Соединение потеряно' : 'Ошибка выполнения',
+          message: cancelled ? 'Выполнение отменено'
+            : kind === 'connection' ? 'Соединение потеряно'
+              : kind === 'bind' ? 'Ошибка параметра'
+                : 'Ошибка выполнения',
         },
       }));
     }
-  }, [api, bootstrap, loadSchemas, refreshDocumentContext, workspace]);
+  }, [api, loadSchemas, refreshDocumentContext]);
+
+  const execute = useCallback(() => {
+    if (!workspace || !bootstrap) return;
+    const document = activeDocument(workspace);
+    if (!document.connectionId) {
+      setToast('Выберите соединение для этой вкладки');
+      return;
+    }
+    const profile = connections.find((candidate) => candidate.id === document.connectionId);
+    if (!profile) {
+      setToast('Соединение для этой вкладки не найдено');
+      return;
+    }
+    const sql = editorRef.current?.getSqlToExecute().trim() ?? document.text.trim();
+    if (!sql) {
+      setToast('Нет SQL для выполнения');
+      return;
+    }
+    const dialect = document.dialect === 'sql' ? profile.kind : document.dialect;
+    const extraction = extractSqlParameters(sql, dialect);
+    if (extraction.error) {
+      setResults((current) => ({
+        ...current,
+        [document.id]: {
+          ...(current[document.id] ?? emptyResult()),
+          status: 'error',
+          error: extraction.error,
+          message: 'Ошибка параметров',
+        },
+      }));
+      return;
+    }
+    const parameters = uniqueSqlParameters(extraction.occurrences);
+    if (parameters.length) {
+      setBindDialog({
+        documentId: document.id,
+        sql,
+        parameters: parameters.map((parameter) => ({
+          ...parameter,
+          initial: lastBindValues.current[document.id]?.[parameter.key],
+        })),
+      });
+      return;
+    }
+    void runSql(document, sql);
+  }, [bootstrap, connections, runSql, workspace]);
 
   const cancel = async () => {
     if (!currentDocument || !result.executionId) return;
@@ -1054,6 +1106,7 @@ export function App() {
       {appClosePhase && <AppCloseDialog phase={appClosePhase} transactionCount={appTransactionCount} dirtyCount={appDirtyCount} onCancel={() => { setAppClosePhase(undefined); void api.confirmAppClose(false); }} onCommitAll={() => { void resolveAppTransactions('commit'); }} onRollbackAll={() => { void resolveAppTransactions('rollback'); }} onDiscardFiles={() => { void discardAllAndClose(); }} onSaveAll={() => { void saveAll().then((saved) => { if (saved) void api.confirmAppClose(true); }); }} />}
       {pendingSessionAction && currentDocument.connectionId && <SessionResetDialog action={pendingSessionAction} onCancel={() => setPendingSessionAction(undefined)} onConfirm={() => { const action = pendingSessionAction; setPendingSessionAction(undefined); void api[action]({ connectionId: currentDocument.connectionId as string, documentId: currentDocument.id, force: true }).catch((error: unknown) => setToast(error instanceof Error ? error.message : String(error))); }} />}
       {lobTarget && <LobViewerDialog cell={lobTarget} onClose={() => setLobTarget(undefined)} />}
+      {bindDialog && <BindParametersDialog parameters={bindDialog.parameters} onCancel={() => setBindDialog(undefined)} onConfirm={(values) => { const request = bindDialog; setBindDialog(undefined); lastBindValues.current[request.documentId] = values; const document = workspace.documents.find((candidate) => candidate.id === request.documentId); if (document) void runSql(document, request.sql, values); }} />}
       {excelState && <ExcelExportDialog hasMore={result.hasMore} loadedRows={result.rows.length} error={excelState.error} onCancel={cancelExcel} onConfirm={(request) => { void exportExcel(request); }} phase={excelState.phase} progress={excelState.progress} result={excelState.result} />}
       {budgetRequests[0] && <LobBudgetDialog request={budgetRequests[0]} onAllow={() => { void answerBudget(budgetRequests[0], true); }} onDecline={() => { void answerBudget(budgetRequests[0], false); }} />}
       {toast && <button className="toast" type="button" onClick={() => setToast(undefined)}>{toast}</button>}
